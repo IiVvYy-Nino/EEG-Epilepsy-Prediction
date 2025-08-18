@@ -1,0 +1,20 @@
+﻿# EEG-Epilepsy-Prediction minimal runtime requirements
+# Note:
+# - torch pinned to 2.5.1. If you need GPU-specific wheels, install torch separately
+#   with the appropriate index URL before running `pip install -r requirements.txt`.
+#   Examples:
+#   CPU:  pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+#   CUDA: pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1
+
+numpy>=1.24,<3.0
+scipy>=1.10,<2.0
+pyEDFlib>=0.1.34
+torch==2.5.1
+# Logging/monitoring
+tensorboard>=2.12
+# CLI/progress
+tqdm>=4.66
+# Config parsing
+PyYAML>=6.0
+# Excel label sheets (for multi-class label building)
+openpyxl>=3.1

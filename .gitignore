@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# large data and caches
+data/
+data_cache/
+outputs/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# build tools
+tools/pycdc/build/
+# ignore entire tools folder
+tools/
+
+# OS files
+.DS_Store
+Thumbs.db
+

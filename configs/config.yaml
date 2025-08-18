@@ -1,0 +1,68 @@
+train:
+  # 训练/评估所用的数据根目录，需包含 .edf 与同名 .tse
+  data_dir: data/Dataset_train_dev
+  # 特征缓存目录（自动生成 .npz 加速重用）
+  cache_dir: data_cache
+  # 特征滑窗长度（秒）
+  window_sec: 2.0
+  # 特征滑窗步长（秒）
+  hop_sec: 0.25
+  # 读取 EDF 后统一重采样到的采样率（Hz）
+  resample_hz: 256.0
+  # 预处理带通/高通/低通范围（None 表示不启用），默认 EEG 常用 0.5–45Hz
+  bandpass: [0.5, 45.0]
+  # 工频陷波（50 或 60，None 表示不启用）
+  notch_hz: 50.0
+  # 背景类标签名（需与 .tse 一致或在别名中可映射）
+  bg_label: bckg
+  # 批大小
+  batch_size: 4
+  # 训练轮数
+  epochs: 5
+  # 验证/测试按病人分层划分比例
+  val_ratio: 0.2
+  test_ratio: 0.0
+  # 随机种子
+  seed: 42
+  # 输出目录（日志/权重/TensorBoard）
+  out_dir: outputs
+  # 学习率调度与数据增强默认值
+  # scheduler: 学习率调度策略（none|cosine|onecycle）
+  scheduler: none  # none|cosine|onecycle
+  # 最大学习率（用于 Adam / OneCycle）
+  max_lr: 0.001
+  # 梯度裁剪阈值（0 表示不裁剪）
+  clip_grad: 0.0
+  # Mixup 强度（>0 开启帧级软目标混合）
+  mixup_alpha: 0.0
+  # SpecAugment：时间维遮挡占比与遮挡块数
+  spec_time_mask_ratio: 0.0
+  spec_time_masks: 0
+  # SpecAugment：特征维遮挡占比与遮挡块数
+  spec_feat_mask_ratio: 0.0
+  spec_feat_masks: 0
+  # 特征级高斯噪声标准差
+  aug_noise_std: 0.0
+
+postprocess:
+  # 前景判定概率阈值（基于 1 - p(background)）
+  prob: 0.8
+  # 前景概率平滑窗口长度（秒），0 为不平滑
+  smooth: 0.25
+  # 事件确认所需的连续窗口数（>=1）
+  confirm: 2
+  # 相邻同类片段的冷却合并时间（秒）
+  cooldown: 0.5
+  # 事件最小时长（秒），不足则忽略
+  min_duration: 0.0
+
+labels:
+  # 背景类名（应与 train.bg_label 保持一致）
+  background: bckg
+  # 发作类型表（规范名-别名），取第一个工作表每行前两列为 (label, alias)
+  excel_types: data/Seizure发作类型表.xlsx
+  # 时段类型表（可选，规则同上）
+  excel_periods: data/Seizure时段类型表.xlsx
+  # 由 Excel 解析后导出的标签集合与别名映射（训练与评估共用）
+  json_out: outputs/labels.json
+
