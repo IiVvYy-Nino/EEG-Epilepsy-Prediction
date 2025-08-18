@@ -4,8 +4,11 @@ __pycache__/
 *.pyd
 
 # large data and caches
-data/
-data_cache/
+# keep placeholder files while ignoring actual contents
+data/**
+!data/.gitkeep
+data_cache/**
+!data_cache/.gitkeep
 outputs/
 
 # IDE/editor
