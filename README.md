@@ -56,6 +56,9 @@ python -c "import torch;print('cuda_available=', torch.cuda.is_available())"
 
 ## 三、数据组织与缓存
 
+- 数据集参考：TUSZ（Temple University Hospital Seizure Corpus，见官网文档）。
+  - 官方主页：`https://www.isip.piconepress.com/projects/tuh_eeg/html/downloads.shtml`
+
 - 将 EDF 与同名 TSE 放入 `data/Dataset_train_dev/`，TSE 行示例：
   - `0.0000 36.8868 bckg 1.0000`（开始秒 结束秒 标签 置信；置信可缺省）
 - 目录示例：
@@ -142,37 +145,70 @@ python -m src.predict --edf path/to/file.edf --checkpoint outputs/best.pt \
 
 ```
 train:
-  data_dir: data/Dataset_train_dev
-  cache_dir: data_cache
+  # 含有 EDF/TSE 成对文件的数据根目录
+  data_dir: <path_to_dataset>  # 例：data/Dataset_train_dev
+  # 特征缓存目录（存放 .npz，加速复用）
+  cache_dir: <path_to_cache>   # 例：data_cache
+  # 特征滑窗长度（秒）
   window_sec: 2.0
+  # 特征滑窗步长（秒）
   hop_sec: 0.25
+  # 读取后统一重采样的频率（Hz）
   resample_hz: 256.0
+  # 预处理带通范围（Hz）；某端置为 null 可退化为高通/低通或不启用
   bandpass: [0.5, 45.0]
+  # 工频陷波（50 或 60）；置为 null 不启用
   notch_hz: 50.0
+  # 背景类名称（需与 .tse 或别名映射一致）
   bg_label: bckg
+  # 批大小（根据显存/内存调整）
   batch_size: 4
+  # 训练轮次（更大数据集可适当增大）
   epochs: 5
+  # 按病人划分的验证/测试比例
   val_ratio: 0.2
   test_ratio: 0.0
+  # 随机种子（复现）
   seed: 42
+  # 输出目录（日志/权重/TensorBoard）
   out_dir: outputs
-  # 学习率调度与增强
-  scheduler: none      # none|cosine|onecycle
+
+  # 学习率调度与数据增强
+  # 建议：小中型数据集可选 onecycle；也可用 none/cosine
+  scheduler: onecycle  # 可选：none|cosine|onecycle
   max_lr: 0.001
+  # 梯度裁剪阈值（0 表示不裁剪）
   clip_grad: 0.0
+  # Mixup 强度（>0 开启帧级软标签混合）
   mixup_alpha: 0.0
+  # SpecAugment 遮挡（0 表示不启用）
   spec_time_mask_ratio: 0.0
   spec_time_masks: 0
   spec_feat_mask_ratio: 0.0
   spec_feat_masks: 0
+  # 特征级高斯噪声强度
   aug_noise_std: 0.0
 
 postprocess:
+  # 基于 1 - p(background) 的判定阈值
   prob: 0.8
+  # 概率平滑窗口（秒）
   smooth: 0.25
+  # 事件确认所需的连续帧数
   confirm: 2
+  # 冷却合并时间（秒，同类相邻事件在此间隔内合并）
   cooldown: 0.5
+  # 最短事件时长（秒，低于此阈值丢弃）
   min_duration: 0.0
+
+labels:
+  # 背景类名称（需与 train.bg_label 保持一致）
+  background: bckg
+  # Excel 表（取第一个 sheet）：每行前两个非空单元格视为 (label, alias)
+  excel_types: <path_to_types.xlsx>
+  excel_periods: <path_to_periods.xlsx>
+  # 训练/评估/推理共用的标签与别名导出文件
+  json_out: <path_to_labels.json>
 ```
 
 要点说明：
@@ -243,3 +279,4 @@ postprocess:
 
 - 许可：见根目录 `LICENSE`。
 - 致谢：感谢开源社区（pyEDFlib、SciPy、PyTorch、TensorBoard 等）提供的生态支持。
+ - 数据集：感谢 Temple University Hospital Seizure Corpus（TUSZ）提供的数据与标注，参考其[官方主页](https://www.isip.piconepress.com/projects/tuh_eeg/html/downloads.shtml)。
