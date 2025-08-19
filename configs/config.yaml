@@ -18,31 +18,45 @@ train:
   # 批大小
   batch_size: 4
   # 训练轮数
-  epochs: 5
-  # 验证/测试按病人分层划分比例
+  epochs: 20
+  # 验证比例（仅用于非 LOSOCV 随机按人划分流程；LOSO 流程不使用该参数）
   val_ratio: 0.2
-  test_ratio: 0.0
   # 随机种子
   seed: 42
   # 输出目录（日志/权重/TensorBoard）
   out_dir: outputs
+  # DataLoader 工作进程数（>0 可并行加速特征预热与加载）
+  num_workers: 0
+  # 训练前特征预热（none|first_batch|all），避免首轮长时间无输出
+  precompute_cache: first_batch
+  # 终端训练进度显示（none|bar）与日志间隔（iter 级日志默认关闭，epoch 汇总总会打印）
+  progress: none
+  log_interval: 0
+  # 是否在训练前先做一次基线验证（默认关闭）
+  eval_at_start: false
   # 学习率调度与数据增强默认值
   # scheduler: 学习率调度策略（none|cosine|onecycle）
-  scheduler: none  # none|cosine|onecycle
+  scheduler: onecycle  # none|cosine|onecycle
   # 最大学习率（用于 Adam / OneCycle）
   max_lr: 0.001
+  # 当 labels 未配置 Excel/labels.json 时，自动从 TSE 中推导标签集合
+  auto_labels_from_tse: true
   # 梯度裁剪阈值（0 表示不裁剪）
-  clip_grad: 0.0
+  clip_grad: 1.0
   # Mixup 强度（>0 开启帧级软目标混合）
-  mixup_alpha: 0.0
+  mixup_alpha: 0.2
   # SpecAugment：时间维遮挡占比与遮挡块数
-  spec_time_mask_ratio: 0.0
-  spec_time_masks: 0
+  spec_time_mask_ratio: 0.1
+  spec_time_masks: 1
   # SpecAugment：特征维遮挡占比与遮挡块数
-  spec_feat_mask_ratio: 0.0
-  spec_feat_masks: 0
+  spec_feat_mask_ratio: 0.1
+  spec_feat_masks: 1
   # 特征级高斯噪声标准差
-  aug_noise_std: 0.0
+  aug_noise_std: 0.01
+  # 帧标注：窗口-标签的重叠比例阈值（例如 0.2 表示窗口与段重叠 ≥20% 才标为该类）
+  label_overlap_ratio: 0.2
+  # 帧标注：忽略短于该时长（秒）的发作段
+  min_seg_duration: 0.0
 
 postprocess:
   # 前景判定概率阈值（基于 1 - p(background)）

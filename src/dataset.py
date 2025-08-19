@@ -14,14 +14,27 @@ import os
 import hashlib
 from typing import List, Tuple, Dict, Optional
 import numpy as np
-from edf_reader import load_edf
-from features import extract_features_multichannel
-from tse_parser import parse_tse, build_frame_labels
-from utils import pair_edf_tse, ensure_dir, save_json, load_json, normalize_label_with_alias
+from .edf_reader import load_edf
+from .features import extract_features_multichannel
+from .tse_parser import parse_tse, build_frame_labels
+from .utils import pair_edf_tse, ensure_dir, save_json, load_json, normalize_label_with_alias
 
 
-def _cache_key(record_id, window_sec, hop_sec, resample_hz=None, bandpass=None, notch_hz=None, notch_q=None):
-	text = f"{record_id}|w{window_sec}|h{hop_sec}|fs{resample_hz}|bp{bandpass}|notch{notch_hz}|q{notch_q}|fv2"
+def _cache_key(
+	record_id,
+	window_sec,
+	hop_sec,
+	resample_hz=None,
+	bandpass=None,
+	notch_hz=None,
+	notch_q=None,
+	label_overlap_ratio=None,
+	min_seg_duration=None,
+):
+	text = (
+		f"{record_id}|w{window_sec}|h{hop_sec}|fs{resample_hz}|bp{bandpass}|"
+		f"notch{notch_hz}|q{notch_q}|ol{label_overlap_ratio}|mindur{min_seg_duration}|fv3"
+	)
 	return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
@@ -43,6 +56,8 @@ class SequenceDataset:
 		standardize: bool = False,
 		stats_path: Optional[str] = None,
 		labels_json: Optional[str] = None,
+		label_overlap_ratio: float = 0.2,
+		min_seg_duration: float = 0.0,
 	):
 		self.data_dir = data_dir
 		self.cache_dir = cache_dir
@@ -58,6 +73,8 @@ class SequenceDataset:
 		self.standardize = standardize
 		self.stats_path = stats_path
 		self.labels_json = labels_json
+		self.label_overlap_ratio = label_overlap_ratio
+		self.min_seg_duration = min_seg_duration
 
 		self._aliases: Optional[Dict[str, str]] = None
 		self._background: Optional[str] = None
@@ -85,7 +102,17 @@ class SequenceDataset:
 		return len(self.items)
 
 	def _cache_path(self, record_id: str) -> str:
-		key = _cache_key(record_id, self.window_sec, self.hop_sec, self.resample_hz, self.bandpass, self.notch_hz, self.notch_q)
+		key = _cache_key(
+			record_id,
+			self.window_sec,
+			self.hop_sec,
+			self.resample_hz,
+			self.bandpass,
+			self.notch_hz,
+			self.notch_q,
+			self.label_overlap_ratio,
+			self.min_seg_duration,
+		)
 		return os.path.join(self.cache_dir, f"{record_id}_{key}.npz")
 
 	def _load_or_compute(self, edf_path: str, tse_path: Optional[str], record_id: str):
@@ -114,7 +141,15 @@ class SequenceDataset:
 			bg = list(self.label_to_index.keys())[0]
 			if self._background:
 				bg = self._background
-			labels = build_frame_labels(centers.tolist(), segments, background_label=bg)
+			# 使用重叠比例阈值与最小时长过滤做帧标注
+			labels = build_frame_labels(
+				centers.tolist(),
+				self.window_sec,
+				segments,
+				background_label=bg,
+				overlap_ratio=float(self.label_overlap_ratio),
+				min_seg_duration=float(self.min_seg_duration),
+			)
 			Y = np.asarray([self.label_to_index.get(lab, -100) for lab in labels], dtype=np.int64)
 		np.savez_compressed(cpath, X=X.astype(np.float32), centers=centers.astype(np.float32), Y=Y if Y is not None else np.array([], dtype=np.int64))
 		return X, Y, centers

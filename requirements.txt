@@ -18,3 +18,5 @@ tqdm>=4.66
 PyYAML>=6.0
 # Excel label sheets (for multi-class label building)
 openpyxl>=3.1
+# Bayesian optimization (for overlap ratio tuning)
+optuna>=3.4

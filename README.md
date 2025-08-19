@@ -88,15 +88,47 @@ data/
   - 如需多类别检测/分型，请提供两张 Excel（示例字段：规范名/别名），训练会自动生成并使用 `outputs/labels.json`；
   - 训练前会进行“类别一致性”前置校验，`.tse` 中的标签必须被 Excel 定义的标签/别名覆盖。
 
-3) 训练（OneCycleLR + Mixup 示例）
+3) 划分与训练
+
+3.1 固定划分（可选，推荐）
+
+```bash
+python -m src.split \
+  --data_dir data/Dataset_train_dev \
+  --out outputs/splits.json --val_ratio 0.2 --test_ratio 0.2 --seed 42
+```
+
+3.2 训练（OneCycleLR + Mixup 示例）
 
 ```
 python -m src.train --config configs/config.yaml \
-  --scheduler onecycle --mixup_alpha 0.2
+  --scheduler onecycle --mixup_alpha 0.2 \
+  --precompute_cache first_batch --num_workers 0 \
+  --splits_json outputs/splits.json --stratify multiclass
 ```
 
 - TensorBoard：`tensorboard --logdir outputs/tb`
 - 最佳模型：`outputs/best.pt`
+
+3.3 LOSOCV（按受试者留一交叉验证，一键寻优→训练→评估→汇总）
+
+```bash
+python -m src.losocv --run_train --auto_optimize \
+  --config configs/config.yaml \
+  --opt_trials 15 --opt_epochs 3 \
+  --epochs 20 --batch_size 4
+```
+
+- 每折会：
+  - 生成该折的 `train/val/test` 划分 JSON（test 为被留出的受试者；其余按“患者级多类别分层”切分 train/val）
+  - Optuna 寻优帧标注参数（`label_overlap_ratio`、`min_seg_duration`），短训评估挑最优
+  - 用最优参数训练该折最终模型（写入 `outputs/losocv/fold_<PID>/best.pt`）
+  - 评估该折 test，写入 `eval_summary.json` / `eval_records.csv`
+  - 训练与评估日志输出更精简易读（控制台与 `train.log`）
+
+- 全部折完成后自动汇总：
+  - `outputs/losocv/loso_eval_aggregate.json`
+  - 给出“宏平均（简单平均）”与“微平均（按 TP/FP/FN 与时长聚合）”两套指标（优先查看 IoU=0.5）
 
 4) 阈值网格（FA/h 约束 + 写回配置）
 
@@ -106,10 +138,12 @@ python -m src.scan_thresholds \
   --probs 0.6 0.7 0.8 0.9 --smooth 0.0 0.25 \
   --confirm 1 2 3 --cooldown 0.0 0.5 1.0 \
   --min_duration 0.0 --max_fa_per_hour 2.0 \
+  --labels_json outputs/labels.json \
   --out outputs/threshold_grid.json --write_config configs/config.yaml
 ```
 
 - 输出：`outputs/threshold_grid.json`；将最佳阈值写回 `configs/config.yaml:postprocess`。
+ - 说明：脚本当前未加载 checkpoint，使用随机初始化模型进行演示性扫描，主要展示“阈值-指标-写回”的流程。实际使用中建议基于已训练模型进行阈值选择（可自行扩展脚本以加载权重），并始终提供 `--labels_json` 以保证类别集合一致。
 
 5) 评估（从 checkpoint）
 
@@ -121,6 +155,16 @@ python -m src.eval --config configs/config.yaml --checkpoint outputs/best.pt \
 - 输出：
   - `outputs/eval_summary.json`（多 IoU 全局指标）
   - `outputs/eval_records.csv`（逐记录 TP/FP/FN 与起止延迟）
+ - 提示：`labels.json` 的类别顺序需与训练时一致，且需与 checkpoint 分类头的类别数相匹配，否则脚本会报错。
+
+- 针对某一折进行评估（仅该折 test）：
+```bash
+python -m src.eval --config configs/config.yaml \
+  --checkpoint outputs/losocv/fold_<PID>/best.pt \
+  --splits_json outputs/losocv/<PID>.json --use_split test \
+  --out_json outputs/losocv/fold_<PID>/eval_summary.json \
+  --out_csv outputs/losocv/fold_<PID>/eval_records.csv
+```
 
 6) 单文件检测（推理）
 
@@ -131,6 +175,7 @@ python -m src.predict --edf path/to/file.edf --checkpoint outputs/best.pt \
 ```
 
 - 输出：是否存在癫痫事件、段数、每段类型与起止时间。
+ - 提示：checkpoint 的分类头类别数必须与提供的 `labels.json` 一致，否则会提示不匹配错误。
 
 7) 复现与缓存
 
@@ -172,11 +217,27 @@ train:
   seed: 42
   # 输出目录（日志/权重/TensorBoard）
   out_dir: outputs
+  # DataLoader 工作进程数（>0 可并行加速特征预热与加载）
+  num_workers: 0
+  # 训练前特征预热（none|first_batch|all），避免首轮长时间无输出
+  precompute_cache: first_batch
+  # 固定划分文件（可选）：如设置，将按此划分使用 train/val/test 的 record_id 列表
+  splits_json: outputs/splits.json
+  # 分层策略（none|has_seizure|multiclass）：按患者分组的分层划分，默认多分类按类覆盖分层
+  stratify: multiclass
+  # 终端训练进度显示（none|bar）与日志间隔（iter 级日志默认关闭，epoch 汇总总会打印）
+  progress: none
+  log_interval: 0
+  # 是否在训练前先做一次基线验证（默认关闭）
+  eval_at_start: false
+ 
 
   # 学习率调度与数据增强
   # 建议：小中型数据集可选 onecycle；也可用 none/cosine
   scheduler: onecycle  # 可选：none|cosine|onecycle
   max_lr: 0.001
+  # 当未提供 Excel/labels.json 时，可从 TSE 自动推导标签集合
+  auto_labels_from_tse: true
   # 梯度裁剪阈值（0 表示不裁剪）
   clip_grad: 0.0
   # Mixup 强度（>0 开启帧级软标签混合）
@@ -188,6 +249,9 @@ train:
   spec_feat_masks: 0
   # 特征级高斯噪声强度
   aug_noise_std: 0.0
+  # 帧标注：窗口-标签重叠比例阈值（0~1）与最小段时长（秒）
+  label_overlap_ratio: 0.2
+  min_seg_duration: 0.0
 
 postprocess:
   # 基于 1 - p(background) 的判定阈值
@@ -217,7 +281,9 @@ labels:
 - `bandpass/notch_hz` 用于抑制基线漂移与工频噪声；根据实验环境（50/60Hz）调整。
 - 调度器：`onecycle` 在中小数据集上通常更稳定；`cosine` 简洁有效。
 - 增强：`mixup_alpha>0` 开启帧级软标签混合；SpecAugment 用于时间/特征维遮挡；`aug_noise_std` 轻度高斯噪声。
+ - 预热缓存：`precompute_cache` 控制预先构建 `data_cache/*.npz` 的范围；`num_workers` 可并行加速。
 - 后处理：`prob` 越高越保守（减少 FP）；`confirm/cooldown/min_duration` 控制事件碎片化与误报。
+ - 标签：若未提供 Excel/`labels.json` 且开启 `train.auto_labels_from_tse=true`，训练会先扫描 `.tse` 中出现的（非背景）标签并自动构建标签集合；模板中的 Excel 路径仅为示例，如无实际文件请替换为你自己的路径或移除该字段以避免报错。
 
 ---
 
@@ -244,6 +310,12 @@ labels:
 - FA/h：`FP / 总小时`，用于误报警率控制（阈值网格时可用 `--max_fa_per_hour` 约束）。
 - 起止延迟：匹配对的 |Δonset| / |Δoffset| 平均。
 - 后处理流水：平滑 → 二值化 → 确认窗过滤 → 冷却合并 → 最小时长过滤；片段类别以帧概率和（或最大）取主类。
+
+### 汇总口径（LOSOCV）
+- 宏平均（macro）：对各折指标（P/R/F1）做简单平均，公平反映跨受试者泛化。
+- 微平均（micro）：累加 TP/FP/FN 与总时长计算整体 P/R/F1 与 FA/h，反映总体运行点。
+
+汇总文件：`outputs/losocv/loso_eval_aggregate.json`。
 
 ---
 

@@ -21,13 +21,14 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import logging
+from tqdm import tqdm
 
-from utils import ensure_dir, parse_patient_id, load_json, scan_label_set, pair_edf_tse
-from dataset import SequenceDataset
-from model import BiLSTMClassifier
+from .utils import ensure_dir, parse_patient_id, load_json, scan_label_set, pair_edf_tse, save_json
+from .dataset import SequenceDataset
+from .model import BiLSTMClassifier
 
 try:
-	from labels import build_labels_from_excels, write_labels_json
+	from .labels import build_labels_from_excels, write_labels_json
 except Exception:
 	build_labels_from_excels = None
 	write_labels_json = None
@@ -96,13 +97,16 @@ def split_by_patient(items: List[Tuple[str, str, str]], val_ratio: float, test_r
 
 def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
 	model.eval()
+	device = next(model.parameters()).device
 	loss_sum = 0.0
 	num = 0
 	correct = 0
 	count = 0
 	with torch.no_grad():
 		for x, y, lengths in dl:
-			x = x.float()
+			x = x.float().to(device, non_blocking=True)
+			y = y.to(device, non_blocking=True)
+			# lengths kept on CPU for packing utilities
 			logits = model(x, lengths=lengths)
 			B, T, C = logits.shape
 			loss = criterion(logits.reshape(B * T, C), y.reshape(B * T))
@@ -137,23 +141,21 @@ def _mixup(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
 	# x: [B,T,F], y: [B,T] with -100 ignored
 	if alpha <= 0 or x.size(0) < 2:
 		return x, y, None  # no soft targets
-	lam = np.random.beta(alpha, alpha)
+	lam = float(np.random.beta(alpha, alpha))
 	perm = torch.randperm(x.size(0))
 	x2 = x[perm]
 	y2 = y[perm]
 	xm = lam * x + (1 - lam) * x2
-	# build soft targets
+	# build soft targets via two one-hot maps then linear combination
 	B, T = y.shape
-	target = torch.zeros((B, T, num_classes), dtype=torch.float32, device=x.device)
-	mask = (y != -100)
-	idx = y.clone()
-	idx[~mask] = 0
-	target.scatter_(2, idx.unsqueeze(-1), lam)
-	mask2 = (y2 != -100)
-	idx2 = y2.clone()
-	idx2[~mask2] = 0
-	target.scatter_add_(2, idx2.unsqueeze(-1), (1 - lam))
-	# positions where both are ignored remain zeros and will be masked later
+	idx = y.clone(); mask = (y != -100); idx[~mask] = 0
+	idx2 = y2.clone(); mask2 = (y2 != -100); idx2[~mask2] = 0
+	t1 = torch.zeros((B, T, num_classes), dtype=torch.float32, device=x.device)
+	t2 = torch.zeros((B, T, num_classes), dtype=torch.float32, device=x.device)
+	t1.scatter_(2, idx.unsqueeze(-1), 1.0)
+	t2.scatter_(2, idx2.unsqueeze(-1), 1.0)
+	target = lam * t1 + (1 - lam) * t2
+	# positions where y is ignored will be masked later in loss
 	return xm, y, target
 
 
@@ -182,6 +184,8 @@ def main():
 	parser.add_argument("--test_ratio", type=float, default=0.0)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--out_dir", type=str, default="outputs")
+	# dataloader
+	parser.add_argument("--num_workers", type=int, default=0)
 	# scheduler
 	parser.add_argument("--scheduler", type=str, choices=["none", "cosine", "onecycle"], default="none")
 	parser.add_argument("--max_lr", type=float, default=1e-3)
@@ -193,24 +197,64 @@ def main():
 	parser.add_argument("--spec_feat_mask_ratio", type=float, default=0.0)
 	parser.add_argument("--spec_feat_masks", type=int, default=0)
 	parser.add_argument("--aug_noise_std", type=float, default=0.0)
+	# logging/progress
+	parser.add_argument("--log_interval", type=int, default=0)
+	parser.add_argument("--progress", type=str, choices=["none", "bar"], default="none")
+	# evaluation control
+	parser.add_argument("--eval_at_start", action="store_true")
+	# label alignment thresholds
+	parser.add_argument("--label_overlap_ratio", type=float, default=0.2)
+	parser.add_argument("--min_seg_duration", type=float, default=0.0)
+	# precompute cache to avoid long first batch stall
+	parser.add_argument("--precompute_cache", type=str, choices=["none", "first_batch", "all"], default="first_batch")
+	# fixed splits & stratification
+	parser.add_argument("--splits_json", type=str, default=None)
+	parser.add_argument("--stratify", type=str, choices=["none", "has_seizure", "multiclass"], default="multiclass")
+	# optional warm-start from checkpoint (use with care to avoid leakage in LOSO)
+	parser.add_argument("--init_checkpoint", type=str, default=None)
+	# resume from last checkpoint (model+optimizer+scheduler+epoch)
+	parser.add_argument("--resume_from", type=str, default=None)
+	# early stopping
+	parser.add_argument("--early_stop_patience", type=int, default=0, help="Epochs without val improvement before stop; 0 disables")
+	parser.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Minimum improvement in val_loss to reset patience")
+	parser.add_argument("--early_stop_warmup", type=int, default=0, help="Minimum epochs before early stopping can trigger")
 	args = parser.parse_args()
 
+	# Device selection (auto CUDA if available)
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	# human-readable device description
+	if device.type == "cuda":
+		try:
+			_idx = torch.cuda.current_device()
+			_name = torch.cuda.get_device_name(_idx)
+			device_desc = f"cuda:{_idx} ({_name})"
+		except Exception:
+			device_desc = "cuda"
+	else:
+		device_desc = "cpu"
+
 	# Load YAML and override defaults
-	cfg = load_config(args.config).get("train", {}) if args.config else {}
-	for k, v in cfg.items():
-		if hasattr(args, k):
-			setattr(args, k, v)
+	# Load YAML; let CLI override config: only fill args still at parser defaults.
+	cfg_all = load_config(args.config) if args.config else {}
+	cfg_train = cfg_all.get("train", {}) if cfg_all else {}
+	if cfg_train:
+		defaults = {k: parser.get_default(k) for k in vars(args)}
+		for k, v in cfg_train.items():
+			if hasattr(args, k) and getattr(args, k) == defaults.get(k):
+				setattr(args, k, v)
 
 	ensure_dir(args.cache_dir)
 	ensure_dir(args.out_dir)
 	logger = setup_logger(os.path.join(args.out_dir, "train.log"))
 	writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb"))
+	logger.info("Using device: %s", device_desc)
 	logger.info("Starting training with args: %s", {k: getattr(args, k) for k in vars(args)})
 
 	label_to_index: Dict[str, int] = {args.bg_label: 0}
 
-	# Labels from Excel (optional)
-	labels_cfg = cfg.get("labels", {}) if cfg else {}
+	# Labels from Excel or existing labels.json (optional)
+	labels_cfg = cfg_all.get("labels", {}) if cfg_all else {}
+	labels_json_path = None
 	if labels_cfg and build_labels_from_excels is not None:
 		bg = labels_cfg.get("background", args.bg_label)
 		types_xlsx = labels_cfg.get("excel_types")
@@ -224,8 +268,19 @@ def main():
 			labels_json_path = json_out
 		except Exception:
 			labels_json_path = None
-	else:
-		labels_json_path = None
+	# Fallback: load existing labels.json if provided and exists
+	if (labels_json_path is None) and labels_cfg:
+		lj_path = labels_cfg.get("json_out")
+		if lj_path and os.path.exists(lj_path):
+			lj = load_json(lj_path)
+			ln = (lj.get("label_names", []) or [])
+			# ensure background at index 0
+			if args.bg_label not in ln:
+				label_names = [args.bg_label] + [n for n in ln if n != args.bg_label]
+			else:
+				label_names = [args.bg_label] + [n for n in ln if n != args.bg_label]
+			label_to_index = {name: i for i, name in enumerate(label_names)}
+			labels_json_path = lj_path
 
 	# Early label consistency check before dataset split
 	try:
@@ -246,10 +301,24 @@ def main():
 				if canon not in known:
 					unknown.append(lab)
 			if unknown:
-				raise RuntimeError(
-					"Found labels in TSE not covered by training label set: "
-					f"{sorted(set(unknown))}. Configure labels via configs/labels or provide labels.json."
-				)
+				auto_from_tse = bool(cfg_train.get("auto_labels_from_tse", False))
+				if auto_from_tse and (not labels_cfg or not (labels_cfg.get("excel_types") or labels_cfg.get("json_out"))):
+					# Derive label set from TSE present labels
+					canon_set = []
+					for lab in present:
+						if lab.lower() == args.bg_label.lower():
+							continue
+						canon = alias_map.get(lab.lower(), lab)
+						if canon not in canon_set:
+							canon_set.append(canon)
+					label_names = [args.bg_label] + sorted(canon_set)
+					label_to_index = {name: i for i, name in enumerate(label_names)}
+					logger.info("Auto-derived label set from TSE: %s", label_names)
+				else:
+					raise RuntimeError(
+						"Found labels in TSE not covered by training label set: "
+						f"{sorted(set(unknown))}. Configure labels via configs/labels or provide labels.json."
+					)
 	except Exception as e:
 		# If directory missing or other non-fatal issues, continue and let later steps surface errors
 		if isinstance(e, RuntimeError):
@@ -267,8 +336,192 @@ def main():
 		require_labels=False,
 		standardize=False,
 		labels_json=labels_json_path,
+		label_overlap_ratio=args.label_overlap_ratio,
+		min_seg_duration=args.min_seg_duration,
 	)
-	train_items, val_items, _ = split_by_patient(ds_full.items, args.val_ratio, args.test_ratio, seed=args.seed)
+	# Use fixed splits if provided; otherwise random split by patient.
+	# If splits_json path is provided but missing, auto-create and save to that path.
+	if args.splits_json:
+		id2item = {rec: it for (edf, tse, rec) in ds_full.items for it in [(edf, tse, rec)]}
+		if os.path.exists(args.splits_json):
+			sp = load_json(args.splits_json)
+		else:
+			logger.info("splits_json not found. Auto-creating patient-level split → %s", args.splits_json)
+			# build by patient from current items with optional stratification
+			all_items = ds_full.items
+			# map patient -> records and tse paths
+			patient_to_records: Dict[str, List[str]] = {}
+			patient_to_tses: Dict[str, List[str]] = {}
+			for _edf, _tse, rec in all_items:
+				pid = parse_patient_id(rec)
+				patient_to_records.setdefault(pid, []).append(rec)
+				if _tse:
+					patient_to_tses.setdefault(pid, []).append(_tse)
+			pids = list(patient_to_records.keys())
+			rng = np.random.RandomState(args.seed)
+			rng.shuffle(pids)
+			if args.stratify == "has_seizure":
+				# classify patients by whether any non-background label appears in their TSEs
+				alias_map: Dict[str, str] = {}
+				if labels_json_path and os.path.exists(labels_json_path):
+					lj = load_json(labels_json_path)
+					alias_map = {k.lower(): v for k, v in (lj.get("aliases", {}) or {}).items()}
+				bg_lower = args.bg_label.lower()
+				seizure_pids: List[str] = []
+				background_pids: List[str] = []
+				for pid in pids:
+					paths = patient_to_tses.get(pid, [])
+					found_seizure = False
+					for tp in paths:
+						try:
+							with open(tp, "r", encoding="utf-8", errors="ignore") as f:
+								for line in f:
+									parts = line.strip().split()
+									if len(parts) >= 3:
+										lab = parts[2]
+										lab_canon = alias_map.get(lab.lower(), lab)
+										if lab_canon.lower() != bg_lower:
+											found_seizure = True
+											break
+						except Exception:
+							pass
+					if found_seizure:
+						seizure_pids.append(pid)
+					else:
+						background_pids.append(pid)
+				# shuffle groups deterministically
+				rng.shuffle(seizure_pids)
+				rng.shuffle(background_pids)
+				def slice_group(group: List[str], val_r: float, test_r: float) -> Tuple[set, set, set]:
+					n = len(group)
+					n_test = int(round(n * test_r))
+					n_val = int(round(n * val_r))
+					val_ids = set(group[:n_val])
+					test_ids = set(group[n_val:n_val + n_test])
+					train_ids = set(group[n_val + n_test:])
+					return train_ids, val_ids, test_ids
+				tr_a, va_a, te_a = slice_group(seizure_pids, args.val_ratio, args.test_ratio)
+				tr_b, va_b, te_b = slice_group(background_pids, args.val_ratio, args.test_ratio)
+				train_ids = tr_a.union(tr_b)
+				val_ids = va_a.union(va_b)
+				test_ids = te_a.union(te_b)
+			elif args.stratify == "multiclass":
+				# Multi-class patient-level stratification by class presence vector
+				# Build canonical label list (exclude background)
+				label_names = list(label_to_index.keys())
+				classes = [ln for ln in label_names if ln.lower() != args.bg_label.lower()]
+				if not classes:
+					# fallback
+					n = len(pids)
+					n_test = int(round(n * args.test_ratio))
+					n_val = int(round(n * args.val_ratio))
+					val_ids = set(pids[:n_val])
+					test_ids = set(pids[n_val:n_val + n_test])
+					train_ids = set(pids[n_val + n_test:])
+				else:
+					# Build per-patient set of present classes
+					alias_map: Dict[str, str] = {}
+					if labels_json_path and os.path.exists(labels_json_path):
+						lj = load_json(labels_json_path)
+						alias_map = {k.lower(): v for k, v in (lj.get("aliases", {}) or {}).items()}
+					bg_lower = args.bg_label.lower()
+					patient_classes: Dict[str, set] = {pid: set() for pid in pids}
+					for pid in pids:
+						for tp in patient_to_tses.get(pid, []):
+							try:
+								with open(tp, "r", encoding="utf-8", errors="ignore") as f:
+									for line in f:
+										parts = line.strip().split()
+										if len(parts) >= 3:
+											lab = parts[2]
+											if lab.lower().startswith("tse_v"):
+												continue
+											lab_canon = alias_map.get(lab.lower(), lab)
+											if lab_canon.lower() == bg_lower:
+												continue
+											# only keep labels present in training label set
+											if lab_canon not in label_to_index:
+												continue
+											patient_classes[pid].add(lab_canon)
+							except Exception:
+								pass
+					# total counts per class across patients
+					total_per_class: Dict[str, int] = {c: 0 for c in classes}
+					for pid in pids:
+						for c in patient_classes[pid]:
+							if c in total_per_class:
+								total_per_class[c] += 1
+					# per split targets
+					r_train = 1.0 - (args.val_ratio + args.test_ratio)
+					r_val = args.val_ratio
+					r_test = args.test_ratio
+					target_train = {c: int(round(total_per_class[c] * r_train)) for c in classes}
+					target_val = {c: int(round(total_per_class[c] * r_val)) for c in classes}
+					target_test = {c: int(round(total_per_class[c] * r_test)) for c in classes}
+					# split capacities in patients count
+					n = len(pids)
+					n_test = int(round(n * args.test_ratio))
+					n_val = int(round(n * args.val_ratio))
+					cap = {"train": n - n_val - n_test, "val": n_val, "test": n_test}
+					# current counts
+					cur = {"train": {c: 0 for c in classes}, "val": {c: 0 for c in classes}, "test": {c: 0 for c in classes}}
+					sizes = {"train": 0, "val": 0, "test": 0}
+					# patient order: prioritize rare-class holders
+					rarity = {c: max(total_per_class[c], 1) for c in classes}
+					def rarity_score(pid: str) -> float:
+						return sum(1.0 / rarity.get(c, 1) for c in patient_classes[pid])
+					order = sorted(pids, key=lambda p: (-rarity_score(p), len(patient_classes[p])), reverse=False)
+					assign: Dict[str, str] = {}
+					for pid in order:
+						labels = list(patient_classes[pid])
+						# compute need score per split
+						def need(split: str) -> float:
+							need_sum = 0.0
+							for c in labels:
+								if split == "train":
+									target = target_train[c]
+									curc = cur["train"][c]
+								elif split == "val":
+									target = target_val[c]
+									curc = cur["val"][c]
+								else:
+									target = target_test[c]
+									curc = cur["test"][c]
+								need_sum += max(target - curc, 0)
+							return need_sum
+						candidates = [s for s in ["train", "val", "test"] if sizes[s] < cap[s]] or ["train", "val", "test"]
+						best_split = max(candidates, key=lambda s: (need(s), -sizes[s]))
+						assign[pid] = best_split
+						sizes[best_split] += 1
+						for c in labels:
+							cur[best_split][c] += 1
+					train_ids = {p for p, s in assign.items() if s == "train"}
+					val_ids = {p for p, s in assign.items() if s == "val"}
+					test_ids = {p for p, s in assign.items() if s == "test"}
+			else:
+				# plain random by patient
+				n = len(pids)
+				n_test = int(round(n * args.test_ratio))
+				n_val = int(round(n * args.val_ratio))
+				val_ids = set(pids[:n_val])
+				test_ids = set(pids[n_val:n_val + n_test])
+				train_ids = set(pids[n_val + n_test:])
+			def collect(idset):
+				res = []
+				for pid in idset:
+					res.extend(patient_to_records[pid])
+				return res
+			sp = {"train": collect(train_ids), "val": collect(val_ids), "test": collect(test_ids)}
+			ensure_dir(os.path.dirname(args.splits_json) or ".")
+			save_json(sp, args.splits_json)
+			logger.info("Created splits: train=%d val=%d test=%d", len(sp.get("train", [])), len(sp.get("val", [])), len(sp.get("test", [])))
+		train_items = [id2item[r] for r in (sp.get("train", []) or []) if r in id2item]
+		val_items = [id2item[r] for r in (sp.get("val", []) or []) if r in id2item]
+		_ = [id2item[r] for r in (sp.get("test", []) or []) if r in id2item]
+		if not train_items or not val_items:
+			train_items, val_items, _ = split_by_patient(ds_full.items, args.val_ratio, args.test_ratio, seed=args.seed)
+	else:
+		train_items, val_items, _ = split_by_patient(ds_full.items, args.val_ratio, args.test_ratio, seed=args.seed)
 	# Create shallow dataset views by overriding items
 	ds_train = ds_full
 	ds_train.items = train_items
@@ -284,18 +537,62 @@ def main():
 		require_labels=False,
 		standardize=False,
 		labels_json=labels_json_path,
+		label_overlap_ratio=args.label_overlap_ratio,
+		min_seg_duration=args.min_seg_duration,
 	)
 	ds_val.items = val_items
 
-	dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, collate_fn=collate_batch)
-	dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, collate_fn=collate_batch)
+	pin_mem = bool(torch.cuda.is_available())
+	dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, collate_fn=collate_batch, num_workers=args.num_workers, pin_memory=pin_mem)
+	dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, collate_fn=collate_batch, num_workers=args.num_workers, pin_memory=pin_mem)
 
-	# Infer dims
+	# Optional: precompute features to warm up cache and show progress
+	if args.precompute_cache != "none":
+		if args.precompute_cache == "all":
+			warm_n = len(ds_train.items)
+		else:
+			warm_n = min(len(ds_train.items), args.batch_size)
+		logger.info("Precomputing features for %d record(s) to warm up cache...", warm_n)
+		for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
+			_ = ds_train[i]
+
+	# Infer dims (after warm-up, this should be fast)
 	x0, y0, lengths0 = next(iter(dl_train))
 	input_dim = x0.shape[-1]
 	num_classes = len(label_to_index)
 	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=num_classes)
-	criterion = nn.CrossEntropyLoss(ignore_index=-100)
+	model = model.to(device)
+	# Warm start
+	if args.init_checkpoint and os.path.exists(args.init_checkpoint):
+		try:
+			ckpt = torch.load(args.init_checkpoint, map_location="cpu")
+			state = ckpt.get("model", ckpt)
+			# best-effort load
+			model.load_state_dict(state, strict=False)
+			logger.info("Loaded init checkpoint from %s", args.init_checkpoint)
+		except Exception as e:
+			logger.info("Failed to load init checkpoint %s: %s", args.init_checkpoint, e)
+	# class weights (optional): compute inverse-frequency weights from a small sample
+	weights = None
+	try:
+		# sample a few batches to estimate class freq
+		freq = np.zeros((num_classes,), dtype=np.int64)
+		cnt = 0
+		for _i, (_x, _y, _l) in zip(range(3), dl_train):
+			mask = (_y != -100)
+			vals, counts = torch.unique(_y[mask], return_counts=True)
+			for v, c in zip(vals.tolist(), counts.tolist()):
+				freq[int(v)] += int(c)
+			cnt += 1
+		if cnt > 0 and freq.sum() > 0:
+			f = freq.astype(np.float64)
+			inv = (1.0 / np.maximum(f, 1.0))
+			w = inv / inv.sum() * num_classes
+			weights = torch.tensor(w, dtype=torch.float32)
+	except Exception:
+		weights = None
+	criterion = nn.CrossEntropyLoss(ignore_index=-100, weight=weights)
+	criterion = criterion.to(device)
 	optim = torch.optim.Adam(model.parameters(), lr=args.max_lr)
 
 	# Scheduler
@@ -308,12 +605,49 @@ def main():
 
 	best_val = float("inf")
 	best_path = os.path.join(args.out_dir, "best.pt")
+	last_path = os.path.join(args.out_dir, "last.pt")
 	start = time.time()
 	global_step = 0
-	for epoch in range(1, args.epochs + 1):
+
+	# Optionally resume training state
+	resume_epoch = 0
+	if args.resume_from and os.path.exists(args.resume_from):
+		try:
+			ckpt = torch.load(args.resume_from, map_location="cpu")
+			state = ckpt.get("model", ckpt)
+			model.load_state_dict(state, strict=False)
+			if "optimizer" in ckpt:
+				optim.load_state_dict(ckpt["optimizer"])
+			if scheduler is not None and ("scheduler" in ckpt):
+				scheduler.load_state_dict(ckpt["scheduler"])
+			resume_epoch = int(ckpt.get("epoch", 0))
+			best_val = float(ckpt.get("best_val", best_val))
+			global_step = int(ckpt.get("global_step", global_step))
+			logger.info("Resumed from %s @ epoch %d (best_val=%.6f)", args.resume_from, resume_epoch, best_val)
+		except Exception as e:
+			logger.info("Failed to resume from %s: %s", args.resume_from, e)
+
+	# Optional baseline evaluation before any training
+	if args.eval_at_start:
+		val_loss0, val_acc0 = evaluate(model, dl_val, criterion)
+		is_best0 = val_loss0 < best_val
+		logger.info(
+			"Epoch %d/%d | train_loss: %s | val_loss: %.4f | val_acc: %.4f | lr: %.2e | best: %s",
+			0, args.epochs, "-", val_loss0, val_acc0, optim.param_groups[0]["lr"], "✓" if is_best0 else "-",
+		)
+		writer.add_scalar("val/loss", float(val_loss0), 0)
+		writer.add_scalar("val/acc", float(val_acc0), 0)
+		if is_best0:
+			best_val = val_loss0
+			torch.save({"model": model.state_dict(), "epoch": 0, "val_loss": val_loss0}, best_path)
+			logger.info("Best checkpoint updated → %s", best_path)
+	for epoch in range(max(1, resume_epoch + 1), args.epochs + 1):
 		model.train()
+		epoch_loss_sum = 0.0
+		epoch_loss_count = 0
 		for it, (x, y, lengths) in enumerate(dl_train, start=1):
-			x = x.float()
+			x = x.float().to(device, non_blocking=True)
+			y = y.to(device, non_blocking=True)
 			# augment: gaussian noise
 			if args.aug_noise_std > 0:
 				x = x + torch.randn_like(x) * args.aug_noise_std
@@ -329,6 +663,8 @@ def main():
 				loss = _soft_ce_loss(logits, soft_targets, ignore_mask)
 			else:
 				loss = criterion(logits.reshape(B * T, C), y.reshape(B * T))
+			epoch_loss_sum += float(loss.item())
+			epoch_loss_count += 1
 			optim.zero_grad()
 			loss.backward()
 			if args.clip_grad and args.clip_grad > 0:
@@ -337,24 +673,67 @@ def main():
 			if args.scheduler == "onecycle" and scheduler is not None:
 				scheduler.step()
 			global_step += 1
-			if it % 10 == 0:
-				lr = optim.param_groups[0]["lr"]
-				logger.info("epoch %d iter %d loss %.4f lr %.2e", epoch, it, loss.item(), lr)
-				writer.add_scalar("train/loss", float(loss.item()), global_step)
-				writer.add_scalar("train/lr", float(lr), global_step)
 
 		# epoch end
 		if args.scheduler == "cosine" and scheduler is not None:
 			scheduler.step()
 
+		# once per epoch logging (pretty one-line summary)
+		avg_train = (epoch_loss_sum / max(epoch_loss_count, 1)) if epoch_loss_count > 0 else 0.0
+		lr = optim.param_groups[0]["lr"]
 		val_loss, val_acc = evaluate(model, dl_val, criterion)
-		logger.info("epoch %d val_loss %.4f val_acc %.4f", epoch, val_loss, val_acc)
+		is_best = val_loss < best_val
+		logger.info(
+			"Epoch %d/%d | train_loss: %.4f | val_loss: %.4f | val_acc: %.4f | lr: %.2e | best: %s",
+			epoch, args.epochs, avg_train, val_loss, val_acc, lr, "✓" if is_best else "-",
+		)
+		writer.add_scalar("train/epoch_avg_loss", float(avg_train), epoch)
+		writer.add_scalar("train/lr", float(lr), epoch)
 		writer.add_scalar("val/loss", float(val_loss), epoch)
 		writer.add_scalar("val/acc", float(val_acc), epoch)
-		if val_loss < best_val:
+		if is_best:
 			best_val = val_loss
-			torch.save({"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss}, best_path)
-			logger.info("Saved best checkpoint at %s", best_path)
+			torch.save({"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "best_val": best_val}, best_path)
+			logger.info("Best checkpoint updated → %s", best_path)
+
+		# Early stopping check
+		if not hasattr(main, "_no_improve"):
+			setattr(main, "_no_improve", 0)
+		no_improve = getattr(main, "_no_improve")
+		if is_best and (best_val + args.early_stop_min_delta <= val_loss):
+			# this branch logically won't hit because best_val was updated; keep for clarity
+			setattr(main, "_no_improve", 0)
+		elif is_best:
+			setattr(main, "_no_improve", 0)
+		else:
+			setattr(main, "_no_improve", no_improve + 1)
+		no_improve = getattr(main, "_no_improve")
+		if args.early_stop_patience > 0 and epoch >= args.early_stop_warmup:
+			if no_improve >= args.early_stop_patience:
+				logger.info("Early stopping triggered at epoch %d (no improvement for %d epochs)", epoch, no_improve)
+				# save last state before break
+				to_save = {
+					"model": model.state_dict(),
+					"optimizer": optim.state_dict(),
+					"epoch": epoch,
+					"best_val": best_val,
+					"global_step": global_step,
+				}
+				if scheduler is not None:
+					to_save["scheduler"] = scheduler.state_dict()
+				torch.save(to_save, last_path)
+				break
+		# always save last checkpoint for resume
+		to_save = {
+			"model": model.state_dict(),
+			"optimizer": optim.state_dict(),
+			"epoch": epoch,
+			"best_val": best_val,
+			"global_step": global_step,
+		}
+		if scheduler is not None:
+			to_save["scheduler"] = scheduler.state_dict()
+		torch.save(to_save, last_path)
 
 	elapsed = time.time() - start
 	logger.info("Training finished in %.1fs", elapsed)

@@ -19,11 +19,11 @@ import numpy as np
 import torch
 import yaml
 
-from utils import ensure_dir, load_json, scan_label_set
-from dataset import SequenceDataset
-from model import BiLSTMClassifier
-from postprocess import decode_pred_events
-from metrics import match_events_by_iou, precision_recall_f1, false_alarms_per_hour, interval_iou, mean_onset_offset_latency
+from .utils import ensure_dir, load_json, scan_label_set
+from .dataset import SequenceDataset
+from .model import BiLSTMClassifier
+from .postprocess import decode_pred_events
+from .metrics import match_events_by_iou, precision_recall_f1, false_alarms_per_hour, interval_iou, mean_onset_offset_latency
 
 
 def decode_gt_events(labels: np.ndarray, centers: np.ndarray, bg_idx: int) -> List[Dict]:
@@ -67,6 +67,9 @@ def main():
 	parser.add_argument("--out_json", type=str, default="outputs/eval_summary.json")
 	parser.add_argument("--out_csv", type=str, default="outputs/eval_records.csv")
 	parser.add_argument("--ious", type=float, nargs="*", default=[0.3, 0.5])
+	# optional split filtering
+	parser.add_argument("--splits_json", type=str, default=None, help="If provided, restrict evaluation to records listed in the given split JSON")
+	parser.add_argument("--use_split", type=str, choices=["train", "val", "test"], default="test")
 	# postprocess override (fallback to config.postprocess if present)
 	parser.add_argument("--prob", type=float, default=None)
 	parser.add_argument("--smooth", type=float, default=None)
@@ -76,6 +79,18 @@ def main():
 	# labels
 	parser.add_argument("--labels_json", type=str, default=None, help="Path to labels.json generated during training (for class set and aliases)")
 	args = parser.parse_args()
+
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	if device.type == "cuda":
+		try:
+			_idx = torch.cuda.current_device()
+			_name = torch.cuda.get_device_name(_idx)
+			device_desc = f"cuda:{_idx} ({_name})"
+		except Exception:
+			device_desc = "cuda"
+	else:
+		device_desc = "cpu"
+	print({"device": device_desc})
 
 	cfg = load_config(args.config)
 	pp = cfg.get("postprocess", {}) if cfg else {}
@@ -120,6 +135,16 @@ def main():
 		standardize=False,
 		labels_json=labels_json_path,
 	)
+	# If a split file is provided, restrict to that subset (e.g., test fold)
+	if args.splits_json and os.path.exists(args.splits_json):
+		try:
+			splits = load_json(args.splits_json)
+			rec_list = splits.get(args.use_split, []) or []
+			allowed = set(rec_list)
+			# filter ds.items by record_id
+			ds.items = [it for it in ds.items if it[2] in allowed]
+		except Exception:
+			pass
 
 	# Validate that TSE labels are covered by the configured label set (considering aliases)
 	tse_paths = [t for (_e, t, _r) in ds.items if t]
@@ -151,11 +176,13 @@ def main():
 					if trained_classes != len(label_to_index):
 						raise RuntimeError(f"Checkpoint classifier classes ({trained_classes}) do not match current label set size ({len(label_to_index)}). Use matching --labels_json or checkpoint.")
 		model.load_state_dict(state, strict=False)
+	model = model.to(device)
 	model.eval()
 
 	bg_idx = label_to_index[args.bg_label]
 	global_metrics: Dict[str, Dict[str, float]] = {}
 	per_record_rows: List[Dict] = []
+	micro_totals: Dict[str, Dict[str, float]] = {}
 	for iou_thr in args.ious:
 		TP = FP = FN = 0
 		on_lat_sum = 0.0
@@ -167,7 +194,8 @@ def main():
 			X = data["x"]; centers = data["centers"]; Y = data["y"]
 			total_seconds += float(centers[-1] - centers[0]) if len(centers) > 1 else 0.0
 			with torch.no_grad():
-				logits = model(torch.from_numpy(X[None, ...]))
+				inp = torch.from_numpy(X[None, ...]).to(device)
+				logits = model(inp)
 				probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 			pred_events = decode_pred_events(
 				probs=probs,
@@ -185,6 +213,8 @@ def main():
 			TP += tp; FP += fp; FN += fn
 			mo, mf = mean_onset_offset_latency(pred_events, gt_events, pairs)
 			on_lat_sum += mo; off_lat_sum += mf; lat_count += (1 if pairs else 0)
+			# per-record duration for potential aggregation
+			rec_dur = float(centers[-1] - centers[0]) if len(centers) > 1 else 0.0
 			per_record_rows.append({
 				"record_id": data["record_id"],
 				"pred_events": len(pred_events),
@@ -192,18 +222,27 @@ def main():
 				"tp": tp, "fp": fp, "fn": fn,
 				"onset_latency": mo, "offset_latency": mf,
 				"iou": iou_thr,
+				"duration_sec": rec_dur,
 			})
 		fa_per_h = false_alarms_per_hour(FP, total_seconds / 3600.0)
 		prec, rec, f1 = precision_recall_f1(TP, FP, FN)
 		mean_on = (on_lat_sum / max(lat_count, 1)) if lat_count > 0 else 0.0
 		mean_off = (off_lat_sum / max(lat_count, 1)) if lat_count > 0 else 0.0
-		global_metrics[str(iou_thr)] = {
+		key = str(iou_thr)
+		global_metrics[key] = {
 			"precision": prec,
 			"recall": rec,
 			"f1": f1,
 			"fa_per_h": fa_per_h,
 			"mean_onset_latency": mean_on,
 			"mean_offset_latency": mean_off,
+		}
+		# store micro totals for downstream aggregation
+		micro_totals[key] = {
+			"TP": float(TP),
+			"FP": float(FP),
+			"FN": float(FN),
+			"total_seconds": float(total_seconds),
 		}
 
 	with open(args.out_json, "w", encoding="utf-8") as jf:
@@ -212,6 +251,7 @@ def main():
 				"prob": prob, "smooth": smooth, "confirm": confirm, "cooldown": cooldown, "min_duration": min_duration
 			},
 			"metrics": global_metrics,
+			"micro_totals": micro_totals,
 		}, jf, ensure_ascii=False, indent=2)
 
 	# CSV per-record

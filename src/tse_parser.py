@@ -37,12 +37,43 @@ def parse_tse(tse_path: str) -> List[Tuple[float, float, str, float]]:
 	return segments
 
 
-def build_frame_labels(frame_centers: List[float], segments: List[Tuple[float, float, str, float]], background_label: str) -> List[str]:
-	"""Assign a label to each frame center time based on segments; default background."""
+def build_frame_labels(
+	frame_centers: List[float],
+	window_sec: float,
+	segments: List[Tuple[float, float, str, float]],
+	background_label: str,
+	overlap_ratio: float = 0.2,
+	min_seg_duration: float = 0.0,
+) -> List[str]:
+	"""Assign labels per window using segment-window overlap ratio.
+
+	A window centered at t spans [t-w/2, t+w/2]. If overlap/window_len >= overlap_ratio,
+	assign the segment label (pick the one with max overlap if multiple).
+	Segments shorter than min_seg_duration are ignored.
+	"""
 	labels: List[str] = [background_label] * len(frame_centers)
+	w = float(max(window_sec, 1e-6))
+	half = 0.5 * w
+	# filter tiny segments
+	filt: List[Tuple[float, float, str]] = []
 	for (s, e, lab, _c) in segments:
-		for i, t in enumerate(frame_centers):
-			if s <= t <= e:
-				labels[i] = lab
+		if (e - s) >= float(min_seg_duration):
+			filt.append((float(s), float(e), lab))
+	if not filt:
+		return labels
+	for i, t in enumerate(frame_centers):
+		ws = float(t) - half
+		we = float(t) + half
+		best_lab = None
+		best_ov = 0.0
+		for (s, e, lab) in filt:
+			ov = max(0.0, min(we, e) - max(ws, s))
+			if ov <= 0:
+				continue
+			if (ov / w) >= overlap_ratio and ov > best_ov:
+				best_ov = ov
+				best_lab = lab
+		if best_lab is not None:
+			labels[i] = best_lab
 	return labels
 

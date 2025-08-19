@@ -18,11 +18,11 @@ import numpy as np
 import torch
 import yaml
 
-from utils import ensure_dir, load_json
-from edf_reader import load_edf
-from features import extract_features_multichannel
-from postprocess import decode_pred_events
-from model import BiLSTMClassifier
+from .utils import ensure_dir, load_json
+from .edf_reader import load_edf
+from .features import extract_features_multichannel
+from .postprocess import decode_pred_events
+from .model import BiLSTMClassifier
 
 
 def load_config(path: str) -> Dict:

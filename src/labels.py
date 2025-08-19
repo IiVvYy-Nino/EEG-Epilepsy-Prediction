@@ -1,4 +1,5 @@
 from typing import Dict, List, Tuple, Optional
+import re
 
 
 def _read_excel_pairs(path: str) -> List[Tuple[str, Optional[str]]]:
@@ -12,15 +13,38 @@ def _read_excel_pairs(path: str) -> List[Tuple[str, Optional[str]]]:
 	wb = openpyxl.load_workbook(path, data_only=True)
 	ws = wb.worksheets[0]
 	pairs: List[Tuple[str, Optional[str]]] = []
+	rec_id_pattern = re.compile(r"^\d{8}_s\d{3}_t\d{3}$", re.IGNORECASE)
+	header_pattern = re.compile(r"^(class( code)?|label|alias|规范名|别名|类型|类别|name|code)$", re.IGNORECASE)
+	noise_word_pattern = re.compile(r"(file(name)?|record|patient|start|end|onset|offset|duration|confidence|备注|说明|sheet|table|index|序号|编号|id)$", re.IGNORECASE)
 	for row in ws.iter_rows(values_only=True):
 		cells = [c for c in row if c is not None]
 		cells = [str(c).strip() for c in cells if str(c).strip()]
 		if not cells:
 			continue
-		if len(cells) == 1:
-			pairs.append((cells[0], None))
+		k0 = cells[0]
+		v0 = cells[1] if len(cells) > 1 else None
+		# 跳过表头/噪声关键字
+		if header_pattern.match(k0) or (v0 is not None and header_pattern.match(v0)):
+			continue
+		if noise_word_pattern.search(k0):
+			continue
+		# 过滤记录ID样式或纯数字/时间戳样式的行
+		if rec_id_pattern.match(k0):
+			continue
+		if k0.replace(".", "", 1).isdigit():
+			continue
+		# 过滤别名列为记录ID/纯数字的情况
+		if v0 is not None:
+			if rec_id_pattern.match(v0):
+				v0 = None
+			elif v0.replace(".", "", 1).isdigit():
+				v0 = None
+			elif noise_word_pattern.search(v0):
+				v0 = None
+		if v0 is None:
+			pairs.append((k0, None))
 		else:
-			pairs.append((cells[0], cells[1]))
+			pairs.append((k0, v0))
 	return pairs
 
 
@@ -38,22 +62,31 @@ def build_labels_from_excels(
 	canon: Dict[str, None] = {}
 	alias_map: Dict[str, str] = {}
 
-	def add_pair(k: str, v: Optional[str]):
-		k_norm = k.strip()
-		if not k_norm:
-			return
-		canon.setdefault(k_norm, None)
-		if v is not None and v.strip() and v.strip().lower() != k_norm.lower():
-			alias_map[v.strip().lower()] = k_norm
-		# 自身别名（小写）
-		alias_map.setdefault(k_norm.lower(), k_norm)
-
+	# 仅从“发作类型表”定义类别集合
 	if types_xlsx:
 		for k, v in _read_excel_pairs(types_xlsx):
-			add_pair(k, v)
-	if periods_xlsx:
+			k_norm = k.strip()
+			if not k_norm:
+				continue
+			canon.setdefault(k_norm, None)
+			# 自身别名（小写）
+			alias_map.setdefault(k_norm.lower(), k_norm)
+			# 第二列作为别名映射到规范名
+			if v is not None and v.strip() and v.strip().lower() != k_norm.lower():
+				alias_map[v.strip().lower()] = k_norm
+
+	# “时段类型表”仅用于增加别名映射，不新增类别
+	if periods_xlsx and canon:
+		canon_l2c = {c.lower(): c for c in canon.keys()}
 		for k, v in _read_excel_pairs(periods_xlsx):
-			add_pair(k, v)
+			k_s = k.strip() if k else ""
+			v_s = v.strip() if (v is not None) else ""
+			# 若第二列（别名→规范名）已在类别集合中，则添加别名映射
+			if v_s and v_s.lower() in canon_l2c:
+				alias_map[k_s.lower()] = canon_l2c[v_s.lower()]
+			# 或者第一列即为规范名，则接受第二列为其别名
+			elif k_s and k_s.lower() in canon_l2c and v_s:
+				alias_map[v_s.lower()] = canon_l2c[k_s.lower()]
 
 	# 确保 background 在首位
 	labels = [background]

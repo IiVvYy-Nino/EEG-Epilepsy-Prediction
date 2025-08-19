@@ -19,11 +19,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from utils import ensure_dir, load_json, scan_label_set
-from dataset import SequenceDataset
-from model import BiLSTMClassifier
-from postprocess import decode_pred_events
-from metrics import match_events_by_iou, precision_recall_f1, false_alarms_per_hour
+from .utils import ensure_dir, load_json, scan_label_set
+from .dataset import SequenceDataset
+from .model import BiLSTMClassifier
+from .postprocess import decode_pred_events
+from .metrics import match_events_by_iou, precision_recall_f1, false_alarms_per_hour
 
 
 def decode_gt_events(labels: np.ndarray, centers: np.ndarray, bg_idx: int) -> List[Dict]:
