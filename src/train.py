@@ -106,7 +106,11 @@ def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module) -> T
 	correct = 0
 	count = 0
 	with torch.no_grad():
-		for x, y, lengths in dl:
+		for batch in dl:
+			if isinstance(batch, (list, tuple)) and len(batch) == 4:
+				x, y, lengths, _ = batch
+			else:
+				x, y, lengths = batch
 			x = x.float().to(device, non_blocking=True)
 			y = y.to(device, non_blocking=True)
 			# lengths kept on CPU for packing utilities
