@@ -592,39 +592,9 @@ def main():
 		for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
 			_ = ds_train[i]
 
-	# Background cache progress monitor (train split)
+	# Global cache progress monitor removed per user request (only per-epoch shown)
 	cache_pbar = None
 	cache_stop_evt = None
-	if args.cache_progress and args.progress == "bar":
-		try:
-			rec_ids = [rec for (_e, _t, rec) in ds_train.items]
-			def _count_cached() -> int:
-				cnt = 0
-				for r in rec_ids:
-					if os.path.exists(ds_train._cache_path(r)):
-						cnt += 1
-				return cnt
-			total_rec = len(rec_ids)
-			cache_pbar = tqdm(total=total_rec, desc="Cache (train)", unit="rec")
-			cache_pbar.n = _count_cached(); cache_pbar.refresh()
-			cache_stop_evt = threading.Event()
-			def _monitor_cache():
-				while not cache_stop_evt.is_set():
-					try:
-						now = 0
-						for r in rec_ids:
-							if os.path.exists(ds_train._cache_path(r)):
-								now += 1
-						if cache_pbar is not None and now != cache_pbar.n:
-							cache_pbar.n = now
-							cache_pbar.refresh()
-					except Exception:
-						pass
-					time.sleep(2.0)
-			threading.Thread(target=_monitor_cache, daemon=True).start()
-		except Exception:
-			cache_pbar = None
-			cache_stop_evt = None
 
 	# Infer feature dimension without touching data (fixed by feature design)
 	input_dim = int(len(EEG_BANDS) * 2 + 2 + 2)  # bands{mean,std} + broadband{mean,std} + RMS{mean,std}
@@ -835,14 +805,7 @@ def main():
 			to_save["scheduler"] = scheduler.state_dict()
 		torch.save(to_save, last_path)
 
-	# stop cache progress monitor
-	if cache_stop_evt is not None:
-		cache_stop_evt.set()
-	if cache_pbar is not None:
-		try:
-			cache_pbar.close()
-		except Exception:
-			pass
+	# no global cache monitor to stop
 
 	elapsed = time.time() - start
 	logger.info("Training finished in %.1fs", elapsed)
