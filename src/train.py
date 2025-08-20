@@ -713,9 +713,11 @@ def main():
 			logger.info("Best checkpoint updated → %s", best_path)
 	for epoch in range(max(1, resume_epoch + 1), args.epochs + 1):
 		model.train()
+		logger.info("Epoch %d/%d starting (batches=%d)", epoch, args.epochs, len(dl_train))
 		epoch_loss_sum = 0.0
 		epoch_loss_count = 0
-		for it, (x, y, lengths) in enumerate(dl_train, start=1):
+		_iter = tqdm(dl_train, desc=f"Train {epoch}/{args.epochs}", unit="batch") if args.progress == "bar" else dl_train
+		for it, (x, y, lengths) in enumerate(_iter, start=1):
 			x = x.float().to(device, non_blocking=True)
 			y = y.to(device, non_blocking=True)
 			# augment: gaussian noise
@@ -740,6 +742,11 @@ def main():
 			if args.clip_grad and args.clip_grad > 0:
 				nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
 			optim.step()
+			if args.progress == "bar":
+				try:
+					_iter.set_postfix({"loss": float(loss.item())})
+				except Exception:
+					pass
 			if args.scheduler == "onecycle" and scheduler is not None:
 				scheduler.step()
 			global_step += 1

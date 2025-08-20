@@ -26,12 +26,14 @@ train:
   # 输出目录（日志/权重/TensorBoard）
   out_dir: outputs
   # DataLoader 工作进程数（>0 可并行加速特征预热与加载）
-  num_workers: 0
+  num_workers: 4
   # 训练前特征预热（none|first_batch|all），避免首轮长时间无输出
   precompute_cache: first_batch
   # 终端训练进度显示（none|bar）与日志间隔（iter 级日志默认关闭，epoch 汇总总会打印）
-  progress: none
+  progress: bar
   log_interval: 0
+  # 训练时显示当前折训练集缓存进度条（需要 progress: bar）
+  cache_progress: true
   # 是否在训练前先做一次基线验证（默认关闭）
   eval_at_start: false
   # 学习率调度与数据增强默认值
