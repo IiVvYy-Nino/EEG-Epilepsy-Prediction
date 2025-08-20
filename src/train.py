@@ -98,7 +98,7 @@ def split_by_patient(items: List[Tuple[str, str, str]], val_ratio: float, test_r
 	return collect(train_ids), collect(val_ids), collect(test_ids)
 
 
-def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
+def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module, show_progress: bool = False) -> Tuple[float, float]:
 	model.eval()
 	device = next(model.parameters()).device
 	loss_sum = 0.0
@@ -106,7 +106,8 @@ def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module) -> T
 	correct = 0
 	count = 0
 	with torch.no_grad():
-		for batch in dl:
+		_iter = tqdm(dl, desc="Validate", unit="batch") if show_progress else dl
+		for batch in _iter:
 			if isinstance(batch, (list, tuple)) and len(batch) == 4:
 				x, y, lengths, _ = batch
 			else:
@@ -123,9 +124,9 @@ def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module) -> T
 			mask = (y != -100)
 			correct += int((pred[mask] == y[mask]).sum().item())
 			count += int(mask.sum().item())
-	avg_loss = loss_sum / max(num, 1)
-	acc = (correct / max(count, 1)) if count > 0 else 0.0
-	return avg_loss, acc
+		avg_loss = loss_sum / max(num, 1)
+		acc = (correct / max(count, 1)) if count > 0 else 0.0
+		return avg_loss, acc
 
 
 def _spec_augment(x: torch.Tensor, time_mask_ratio: float, time_masks: int, feat_mask_ratio: float, feat_masks: int) -> torch.Tensor:
@@ -674,7 +675,7 @@ def main():
 
 	# Optional baseline evaluation before any training
 	if args.eval_at_start:
-		val_loss0, val_acc0 = evaluate(model, dl_val, criterion)
+		val_loss0, val_acc0 = evaluate(model, dl_val, criterion, show_progress=(args.progress == "bar"))
 		is_best0 = val_loss0 < best_val
 		logger.info(
 			"Epoch %d/%d | train_loss: %s | val_loss: %.4f | val_acc: %.4f | lr: %.2e | best: %s",
@@ -755,7 +756,7 @@ def main():
 		# once per epoch logging (pretty one-line summary)
 		avg_train = (epoch_loss_sum / max(epoch_loss_count, 1)) if epoch_loss_count > 0 else 0.0
 		lr = optim.param_groups[0]["lr"]
-		val_loss, val_acc = evaluate(model, dl_val, criterion)
+		val_loss, val_acc = evaluate(model, dl_val, criterion, show_progress=(args.progress == "bar"))
 		is_best = val_loss < best_val
 		logger.info(
 			"Epoch %d/%d | train_loss: %.4f | val_loss: %.4f | val_acc: %.4f | lr: %.2e | best: %s",
