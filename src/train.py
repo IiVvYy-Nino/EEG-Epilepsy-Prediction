@@ -49,7 +49,8 @@ def collate_batch(batch):
 		x_pad[i, :t] = b["x"]
 		if "y" in b and b["y"] is not None and b["y"].size:
 			y_pad[i, :t] = b["y"]
-	return torch.from_numpy(x_pad), torch.from_numpy(y_pad), torch.tensor(lengths, dtype=torch.long)
+	rec_ids = [b.get("record_id") for b in batch]
+	return torch.from_numpy(x_pad), torch.from_numpy(y_pad), torch.tensor(lengths, dtype=torch.long), rec_ids
 
 
 def load_config(path: str) -> Dict:
@@ -716,8 +717,25 @@ def main():
 		logger.info("Epoch %d/%d starting (batches=%d)", epoch, args.epochs, len(dl_train))
 		epoch_loss_sum = 0.0
 		epoch_loss_count = 0
+		# per-epoch cache monitor (only for current epoch)
+		epoch_cache_pbar = None
+		seen_recs = set()
+		def _count_cached_epoch() -> int:
+			return sum(1 for r in seen_recs if os.path.exists(ds_train._cache_path(r)))
+		if args.cache_progress and args.progress == "bar":
+			try:
+				epoch_cache_pbar = tqdm(total=len(dl_train), desc=f"Cache (epoch {epoch})", unit="batch")
+			except Exception:
+				epoch_cache_pbar = None
 		_iter = tqdm(dl_train, desc=f"Train {epoch}/{args.epochs}", unit="batch") if args.progress == "bar" else dl_train
-		for it, (x, y, lengths) in enumerate(_iter, start=1):
+		for it, batch in enumerate(_iter, start=1):
+			x, y, lengths, rec_ids = batch
+			if epoch_cache_pbar is not None:
+				try:
+					seen_recs.update(rec_ids)
+					epoch_cache_pbar.update(1)
+				except Exception:
+					pass
 			x = x.float().to(device, non_blocking=True)
 			y = y.to(device, non_blocking=True)
 			# augment: gaussian noise
@@ -750,6 +768,11 @@ def main():
 			if args.scheduler == "onecycle" and scheduler is not None:
 				scheduler.step()
 			global_step += 1
+		if epoch_cache_pbar is not None:
+			try:
+				epoch_cache_pbar.close()
+			except Exception:
+				pass
 
 		# epoch end
 		if args.scheduler == "cosine" and scheduler is not None:
