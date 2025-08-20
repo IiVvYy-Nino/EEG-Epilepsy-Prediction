@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import logging
@@ -553,8 +553,22 @@ def main():
 		else:
 			warm_n = min(len(ds_train.items), args.batch_size)
 		logger.info("Precomputing features for %d record(s) to warm up cache...", warm_n)
-		for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
-			_ = ds_train[i]
+		# If num_workers>0, use DataLoader to parallelize __getitem__ calls for prewarm
+		if args.num_workers and args.num_workers > 0:
+			prewarm_subset = Subset(ds_train, list(range(warm_n)))
+			prewarm_loader = DataLoader(
+				prewarm_subset,
+				batch_size=1,
+				shuffle=False,
+				num_workers=args.num_workers,
+				collate_fn=lambda _: None,
+				pin_memory=False,
+			)
+			for _ in tqdm(prewarm_loader, desc="Building cache", unit="rec", total=warm_n):
+				pass
+		else:
+			for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
+				_ = ds_train[i]
 
 	# Infer dims (after warm-up, this should be fast)
 	x0, y0, lengths0 = next(iter(dl_train))

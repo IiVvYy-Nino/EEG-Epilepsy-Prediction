@@ -103,9 +103,11 @@ python -m src.split \
 ```
 python -m src.train --config configs/config.yaml \
   --scheduler onecycle --mixup_alpha 0.2 \
-  --precompute_cache first_batch --num_workers 0 \
+  --precompute_cache first_batch --num_workers 4 \
   --splits_json outputs/splits.json --stratify multiclass
 ```
+
+- 预热并行：设置 `num_workers>0` 时，预热阶段使用 DataLoader 并行触发 `__getitem__`，更快构建 `data_cache/*.npz`。
 
 - TensorBoard：`tensorboard --logdir outputs/tb`
 - 最佳模型：`outputs/best.pt`
@@ -281,7 +283,7 @@ labels:
 - `bandpass/notch_hz` 用于抑制基线漂移与工频噪声；根据实验环境（50/60Hz）调整。
 - 调度器：`onecycle` 在中小数据集上通常更稳定；`cosine` 简洁有效。
 - 增强：`mixup_alpha>0` 开启帧级软标签混合；SpecAugment 用于时间/特征维遮挡；`aug_noise_std` 轻度高斯噪声。
- - 预热缓存：`precompute_cache` 控制预先构建 `data_cache/*.npz` 的范围；`num_workers` 可并行加速。
+- 预热缓存：`precompute_cache` 控制预先构建 `data_cache/*.npz` 的范围；当 `num_workers>0` 时预热与训练/验证加载均会并行执行。
 - 后处理：`prob` 越高越保守（减少 FP）；`confirm/cooldown/min_duration` 控制事件碎片化与误报。
  - 标签：若未提供 Excel/`labels.json` 且开启 `train.auto_labels_from_tse=true`，训练会先扫描 `.tse` 中出现的（非背景）标签并自动构建标签集合；模板中的 Excel 路径仅为示例，如无实际文件请替换为你自己的路径或移除该字段以避免报错。
 
