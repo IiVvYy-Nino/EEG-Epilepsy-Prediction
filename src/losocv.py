@@ -150,6 +150,9 @@ def main():
 	ap.add_argument("--config", type=str, default="configs/config.yaml")
 	ap.add_argument("--epochs", type=int, default=10)
 	ap.add_argument("--batch_size", type=int, default=4)
+	# progress visualization passthrough to train
+	ap.add_argument("--progress", type=str, choices=["none", "bar"], default="none")
+	ap.add_argument("--cache_progress", action="store_true")
 	# optional per-fold Bayesian optimization for label overlap params
 	ap.add_argument("--auto_optimize", action="store_true", help="Per-fold Optuna tuning of label_overlap_ratio and min_seg_duration before final training")
 	ap.add_argument("--opt_trials", type=int, default=15)
@@ -214,6 +217,10 @@ def main():
 					"--early_stop_min_delta", str(args.early_stop_min_delta),
 					"--early_stop_warmup", str(args.early_stop_warmup),
 				]
+				# progress passthrough
+				cmd_trial += ["--progress", args.progress]
+				if args.cache_progress:
+					cmd_trial += ["--cache_progress"]
 				# resume from last.pt if requested and available
 				last_ckpt = os.path.join(trial_out, "last.pt")
 				if args.resume and os.path.exists(last_ckpt):
@@ -258,6 +265,10 @@ def main():
 				"--early_stop_min_delta", str(args.early_stop_min_delta),
 				"--early_stop_warmup", str(args.early_stop_warmup),
 			]
+			# progress passthrough
+			cmd += ["--progress", args.progress]
+			if args.cache_progress:
+				cmd += ["--cache_progress"]
 			# resume from last.pt if requested and available
 			last_ckpt_final = os.path.join(fold_out, "last.pt")
 			if args.resume and os.path.exists(last_ckpt_final):
