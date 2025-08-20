@@ -26,6 +26,7 @@ from tqdm import tqdm
 from .utils import ensure_dir, parse_patient_id, load_json, scan_label_set, pair_edf_tse, save_json
 from .dataset import SequenceDataset
 from .model import BiLSTMClassifier
+from .features import EEG_BANDS
 
 try:
 	from .labels import build_labels_from_excels, write_labels_json
@@ -197,6 +198,8 @@ def main():
 	parser.add_argument("--spec_feat_mask_ratio", type=float, default=0.0)
 	parser.add_argument("--spec_feat_masks", type=int, default=0)
 	parser.add_argument("--aug_noise_std", type=float, default=0.0)
+	# optional: estimate class weights from a few batches before training (disabled by default for speed)
+	parser.add_argument("--estimate_class_weights", action="store_true")
 	# logging/progress
 	parser.add_argument("--log_interval", type=int, default=0)
 	parser.add_argument("--progress", type=str, choices=["none", "bar"], default="none")
@@ -219,6 +222,16 @@ def main():
 	parser.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Minimum improvement in val_loss to reset patience")
 	parser.add_argument("--early_stop_warmup", type=int, default=0, help="Minimum epochs before early stopping can trigger")
 	args = parser.parse_args()
+
+	# Prefer 'spawn' when using multiple workers (safer with CUDA and heavy C-extensions)
+	try:
+		import torch.multiprocessing as mp  # type: ignore
+		if (args.num_workers and args.num_workers > 0):
+			cur = mp.get_start_method(allow_none=True)
+			if cur != "spawn":
+				mp.set_start_method("spawn", force=True)
+	except Exception:
+		pass
 
 	# Device selection (auto CUDA if available)
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -543,8 +556,26 @@ def main():
 	ds_val.items = val_items
 
 	pin_mem = bool(torch.cuda.is_available())
-	dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, collate_fn=collate_batch, num_workers=args.num_workers, pin_memory=pin_mem)
-	dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, collate_fn=collate_batch, num_workers=args.num_workers, pin_memory=pin_mem)
+	dl_train = DataLoader(
+		ds_train,
+		batch_size=args.batch_size,
+		shuffle=True,
+		collate_fn=collate_batch,
+		num_workers=args.num_workers,
+		pin_memory=pin_mem,
+		prefetch_factor=1 if args.num_workers and args.num_workers > 0 else None,
+		persistent_workers=False,
+	)
+	dl_val = DataLoader(
+		ds_val,
+		batch_size=args.batch_size,
+		shuffle=False,
+		collate_fn=collate_batch,
+		num_workers=args.num_workers,
+		pin_memory=pin_mem,
+		prefetch_factor=1 if args.num_workers and args.num_workers > 0 else None,
+		persistent_workers=False,
+	)
 
 	# Optional: precompute features to warm up cache and show progress
 	if args.precompute_cache != "none":
@@ -553,26 +584,12 @@ def main():
 		else:
 			warm_n = min(len(ds_train.items), args.batch_size)
 		logger.info("Precomputing features for %d record(s) to warm up cache...", warm_n)
-		# If num_workers>0, use DataLoader to parallelize __getitem__ calls for prewarm
-		if args.num_workers and args.num_workers > 0:
-			prewarm_subset = Subset(ds_train, list(range(warm_n)))
-			prewarm_loader = DataLoader(
-				prewarm_subset,
-				batch_size=1,
-				shuffle=False,
-				num_workers=args.num_workers,
-				collate_fn=lambda _: None,
-				pin_memory=False,
-			)
-			for _ in tqdm(prewarm_loader, desc="Building cache", unit="rec", total=warm_n):
-				pass
-		else:
-			for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
-				_ = ds_train[i]
+		# Always build cache sequentially to avoid worker boot/OMP contention during prewarm
+		for i in tqdm(range(warm_n), desc="Building cache", unit="rec"):
+			_ = ds_train[i]
 
-	# Infer dims (after warm-up, this should be fast)
-	x0, y0, lengths0 = next(iter(dl_train))
-	input_dim = x0.shape[-1]
+	# Infer feature dimension without touching data (fixed by feature design)
+	input_dim = int(len(EEG_BANDS) * 2 + 2 + 2)  # bands{mean,std} + broadband{mean,std} + RMS{mean,std}
 	num_classes = len(label_to_index)
 	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=num_classes)
 	model = model.to(device)
@@ -588,23 +605,25 @@ def main():
 			logger.info("Failed to load init checkpoint %s: %s", args.init_checkpoint, e)
 	# class weights (optional): compute inverse-frequency weights from a small sample
 	weights = None
-	try:
-		# sample a few batches to estimate class freq
-		freq = np.zeros((num_classes,), dtype=np.int64)
-		cnt = 0
-		for _i, (_x, _y, _l) in zip(range(3), dl_train):
-			mask = (_y != -100)
-			vals, counts = torch.unique(_y[mask], return_counts=True)
-			for v, c in zip(vals.tolist(), counts.tolist()):
-				freq[int(v)] += int(c)
-			cnt += 1
-		if cnt > 0 and freq.sum() > 0:
-			f = freq.astype(np.float64)
-			inv = (1.0 / np.maximum(f, 1.0))
-			w = inv / inv.sum() * num_classes
-			weights = torch.tensor(w, dtype=torch.float32)
-	except Exception:
-		weights = None
+	if args.estimate_class_weights:
+		try:
+			logger.info("Estimating class weights from a few batches…")
+			# sample a few batches to estimate class freq
+			freq = np.zeros((num_classes,), dtype=np.int64)
+			cnt = 0
+			for _i, (_x, _y, _l) in zip(range(3), dl_train):
+				mask = (_y != -100)
+				vals, counts = torch.unique(_y[mask], return_counts=True)
+				for v, c in zip(vals.tolist(), counts.tolist()):
+					freq[int(v)] += int(c)
+				cnt += 1
+			if cnt > 0 and freq.sum() > 0:
+				f = freq.astype(np.float64)
+				inv = (1.0 / np.maximum(f, 1.0))
+				w = inv / inv.sum() * num_classes
+				weights = torch.tensor(w, dtype=torch.float32)
+		except Exception:
+			weights = None
 	criterion = nn.CrossEntropyLoss(ignore_index=-100, weight=weights)
 	criterion = criterion.to(device)
 	optim = torch.optim.Adam(model.parameters(), lr=args.max_lr)
