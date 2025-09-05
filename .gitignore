@@ -9,6 +9,7 @@ data/**
 !data/.gitkeep
 data_cache/**
 !data_cache/.gitkeep
+data_cache_test/**
 outputs/
 
 # IDE/editor
