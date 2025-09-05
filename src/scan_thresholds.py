@@ -115,7 +115,16 @@ def main():
 	# 简化：使用随机权重模型（或在此处加载你的 checkpoint）
 	x0 = ds[0]["x"]
 	input_dim = x0.shape[-1]
-	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=len(label_to_index))
+	# 🧠 使用注意力机制模型（与训练时保持一致）
+	model = BiLSTMClassifier(
+		input_dim=input_dim, 
+		hidden_dim=256, 
+		num_layers=3, 
+		num_classes=len(label_to_index),
+		dropout=0.15,
+		use_attention=True,
+		attention_heads=8
+	)
 	model.eval()
 
 	bg_idx = label_to_index[args.bg_label]

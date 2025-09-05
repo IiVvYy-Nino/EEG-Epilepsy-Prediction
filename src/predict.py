@@ -93,7 +93,16 @@ def main():
 	# Build model and run
 	input_dim = X.shape[-1]
 	num_classes = len(label_names)
-	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=num_classes)
+	# 🧠 使用注意力机制模型（与训练时保持一致）
+	model = BiLSTMClassifier(
+		input_dim=input_dim, 
+		hidden_dim=256, 
+		num_layers=3, 
+		num_classes=num_classes,
+		dropout=0.15,
+		use_attention=True,
+		attention_heads=8
+	)
 	if args.checkpoint and os.path.exists(args.checkpoint):
 		state = torch.load(args.checkpoint, map_location="cpu")
 		if isinstance(state, dict) and "model" in state:
@@ -105,7 +114,8 @@ def main():
 		model.load_state_dict(state, strict=False)
 	model.eval()
 	with torch.no_grad():
-		logits = model(torch.from_numpy(X[None, ...]).float())
+		# 🧠 注意力机制：模型返回logits和attention权重
+		logits, attention_info = model(torch.from_numpy(X[None, ...]).float())
 		probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 
 	events_idx = decode_pred_events(

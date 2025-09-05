@@ -164,7 +164,16 @@ def main():
 	# Build model and load checkpoint
 	x0 = ds[0]["x"]
 	input_dim = x0.shape[-1]
-	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=len(label_to_index))
+	# 🧠 使用注意力机制模型（与训练时保持一致）
+	model = BiLSTMClassifier(
+		input_dim=input_dim, 
+		hidden_dim=256, 
+		num_layers=3, 
+		num_classes=len(label_to_index),
+		dropout=0.15,
+		use_attention=True,
+		attention_heads=8
+	)
 	if args.checkpoint and os.path.exists(args.checkpoint):
 		ckpt = torch.load(args.checkpoint, map_location="cpu")
 		state = ckpt.get("model", ckpt)
@@ -195,7 +204,8 @@ def main():
 			total_seconds += float(centers[-1] - centers[0]) if len(centers) > 1 else 0.0
 			with torch.no_grad():
 				inp = torch.from_numpy(X[None, ...]).to(device)
-				logits = model(inp)
+				# 🧠 注意力机制：模型返回logits和attention权重
+				logits, _ = model(inp)
 				probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 			pred_events = decode_pred_events(
 				probs=probs,

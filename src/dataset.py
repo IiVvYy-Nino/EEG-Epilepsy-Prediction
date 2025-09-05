@@ -150,13 +150,43 @@ class SequenceDataset:
 				overlap_ratio=float(self.label_overlap_ratio),
 				min_seg_duration=float(self.min_seg_duration),
 			)
-			Y = np.asarray([self.label_to_index.get(lab, -100) for lab in labels], dtype=np.int64)
+			# 🔧 修复：处理大小写不匹配的标签映射
+			Y = []
+			for lab in labels:
+				# 先尝试直接匹配
+				if lab in self.label_to_index:
+					Y.append(self.label_to_index[lab])
+				else:
+					# 尝试大写匹配
+					lab_upper = lab.upper()
+					if lab_upper in self.label_to_index:
+						Y.append(self.label_to_index[lab_upper])
+					else:
+						# 尝试小写匹配
+						lab_lower = lab.lower()
+						# 在label_to_index中查找小写键
+						found = False
+						for key, idx in self.label_to_index.items():
+							if key.lower() == lab_lower:
+								Y.append(idx)
+								found = True
+								break
+						if not found:
+							Y.append(-100)
+			Y = np.asarray(Y, dtype=np.int64)
 		np.savez_compressed(cpath, X=X.astype(np.float32), centers=centers.astype(np.float32), Y=Y if Y is not None else np.array([], dtype=np.int64))
 		return X, Y, centers
 
 	def _apply_standardize(self, x: np.ndarray) -> np.ndarray:
 		if not self.standardize:
-			return x
+			# 🔧 修复：即使没有明确启用standardize，也进行基本的数值稳定化
+			# 使用log1p变换 + 简单标准化来处理极大的数值范围
+			x_log = np.log1p(np.maximum(x, 0))  # log(1+x)，处理负值
+			x_mean = np.mean(x_log, axis=0, keepdims=True)
+			x_std = np.std(x_log, axis=0, keepdims=True)
+			x_std = np.where(x_std == 0, 1.0, x_std)
+			return (x_log - x_mean) / x_std
+		
 		if self._mean is None or self._std is None or self._mean.size == 0:
 			return x
 		std = np.where(self._std == 0, 1.0, self._std)

@@ -49,36 +49,48 @@ def extract_features_multichannel(
 	starts = np.arange(0, n_samples - win + 1, hop, dtype=int)
 	centers = (starts + win // 2) / float(fs)
 
-	rows = []
-	for s in starts.tolist():
+	# 🔥 OOM修复：预分配特征数组，避免动态增长
+	n_frames = len(starts)
+	n_features = len(EEG_BANDS) * 2 + 2 + 2  # 5频带*2 + 宽带*2 + RMS*2 = 14
+	X = np.zeros((n_frames, n_features), dtype=np.float32)
+	
+	# 🔥 内存优化：批量处理而非逐帧
+	nperseg = min(win, 256)
+	for i, s in enumerate(starts.tolist()):
 		seg = signals[:, s:s + win]  # [C, win]
-		# PSD per channel
-		# nperseg不超过窗口长度；使用汉宁窗
-		nperseg = min(win, 256)
-		# welch 对二维需逐通道
-		psd_list = []
+		
+		# 🔥 内存优化：使用预分配数组
+		psd_array = np.zeros((n_channels, nperseg // 2 + 1), dtype=np.float32)
+		
+		# PSD per channel - 内存优化版本
 		for c in range(n_channels):
 			f, p = welch(seg[c], fs=fs, nperseg=nperseg, noverlap=nperseg // 2, scaling='density')
-			psd_list.append(p)
-		psd = np.stack(psd_list, axis=0)  # [C, F]
-
-		feats = []
+			psd_array[c] = p.astype(np.float32)  # 确保类型一致
+		
+		# 直接填充特征数组
+		feat_idx = 0
+		
 		# 频带功率 mean/std across channels
 		for band in EEG_BANDS.values():
-			bp = _bandpower_from_psd(f, psd, band)  # [C]
-			feats.append(float(np.mean(bp)))
-			feats.append(float(np.std(bp)))
+			bp = _bandpower_from_psd(f, psd_array, band)  # [C]
+			X[i, feat_idx] = np.mean(bp)
+			X[i, feat_idx + 1] = np.std(bp)
+			feat_idx += 2
+		
 		# 宽频功率
 		broad = (0.5, 45.0)
-		bp_broad = _bandpower_from_psd(f, psd, broad)
-		feats.append(float(np.mean(bp_broad)))
-		feats.append(float(np.std(bp_broad)))
+		bp_broad = _bandpower_from_psd(f, psd_array, broad)
+		X[i, feat_idx] = np.mean(bp_broad)
+		X[i, feat_idx + 1] = np.std(bp_broad)
+		feat_idx += 2
+		
 		# 时域 RMS mean/std
 		rms = np.sqrt(np.mean(seg.astype(np.float32) ** 2, axis=1))  # [C]
-		feats.append(float(np.mean(rms)))
-		feats.append(float(np.std(rms)))
-		rows.append(feats)
+		X[i, feat_idx] = np.mean(rms)
+		X[i, feat_idx + 1] = np.std(rms)
+		
+		# 🔥 内存优化：及时释放临时数组
+		del psd_array, seg, rms
 
-	X = np.asarray(rows, dtype=np.float32)
 	return X, centers
 

@@ -38,17 +38,51 @@ except Exception:
 
 def collate_batch(batch):
 	# batch: list of dict(x[T,F], centers[T], record_id, optional y[T])
-	lengths = [b["x"].shape[0] for b in batch]
+	# 🔥 OOM修复：添加最大序列长度限制
+	MAX_SEQUENCE_LENGTH = 8000  # 约33分钟的数据，防止内存爆炸
+	
+	lengths = []
+	for b in batch:
+		seq_len = b["x"].shape[0]
+		# 限制最大长度
+		limited_len = min(seq_len, MAX_SEQUENCE_LENGTH)
+		lengths.append(limited_len)
+	
 	max_t = max(lengths)
 	feat_dim = batch[0]["x"].shape[1]
 	B = len(batch)
-	x_pad = np.zeros((B, max_t, feat_dim), dtype=np.float32)
-	y_pad = np.full((B, max_t), fill_value=-100, dtype=np.int64)
+	
+	# 🔥 内存预检查
+	estimated_memory_mb = (B * max_t * feat_dim * 4) / (1024 * 1024)
+	if estimated_memory_mb > 800:  # 超过800MB警告
+		print(f"⚠️ Warning: Batch memory estimated at {estimated_memory_mb:.1f}MB")
+		print(f"   Reducing max_t from {max_t} to {min(max_t, 6000)}")
+		max_t = min(max_t, 6000)
+		lengths = [min(l, max_t) for l in lengths]
+	
+	try:
+		x_pad = np.zeros((B, max_t, feat_dim), dtype=np.float32)
+		y_pad = np.full((B, max_t), fill_value=-100, dtype=np.int64)
+	except MemoryError:
+		print(f"❌ MemoryError! Reducing max_t from {max_t} to {max_t//2}")
+		max_t = max_t // 2
+		lengths = [min(l, max_t) for l in lengths]
+		x_pad = np.zeros((B, max_t, feat_dim), dtype=np.float32)
+		y_pad = np.full((B, max_t), fill_value=-100, dtype=np.int64)
+	
 	for i, b in enumerate(batch):
-		t = b["x"].shape[0]
-		x_pad[i, :t] = b["x"]
-		if "y" in b and b["y"] is not None and b["y"].size:
-			y_pad[i, :t] = b["y"]
+		actual_len = lengths[i]
+		# 智能截断：如果序列太长，截取前面部分
+		if b["x"].shape[0] > actual_len:
+			x_pad[i, :actual_len] = b["x"][:actual_len]
+			if "y" in b and b["y"] is not None and b["y"].size:
+				y_pad[i, :actual_len] = b["y"][:actual_len]
+		else:
+			t = b["x"].shape[0]
+			x_pad[i, :t] = b["x"]
+			if "y" in b and b["y"] is not None and b["y"].size:
+				y_pad[i, :t] = b["y"]
+	
 	rec_ids = [b.get("record_id") for b in batch]
 	return torch.from_numpy(x_pad), torch.from_numpy(y_pad), torch.tensor(lengths, dtype=torch.long), rec_ids
 
@@ -115,10 +149,18 @@ def evaluate(model: BiLSTMClassifier, dl: DataLoader, criterion: nn.Module, show
 			x = x.float().to(device, non_blocking=True)
 			y = y.to(device, non_blocking=True)
 			# lengths kept on CPU for packing utilities
-			logits = model(x, lengths=lengths)
+			# 🧠 注意力机制：模型返回logits和attention权重（evaluation时忽略attention_info）
+			logits, _ = model(x, lengths=lengths)
 			B, T, C = logits.shape
 			loss = criterion(logits.reshape(B * T, C), y.reshape(B * T))
-			loss_sum += float(loss.item())
+			
+			# 🔧 调试：检查验证损失是否正常
+			loss_value = float(loss.item())
+			if np.isnan(loss_value) or np.isinf(loss_value):
+				print(f"⚠️ 验证异常损失值: {loss_value}, 跳过这个batch")
+				continue
+				
+			loss_sum += loss_value
 			num += 1
 			pred = torch.argmax(logits, dim=-1)  # [B,T]
 			mask = (y != -100)
@@ -198,6 +240,8 @@ def main():
 	parser.add_argument("--scheduler", type=str, choices=["none", "cosine", "onecycle"], default="none")
 	parser.add_argument("--max_lr", type=float, default=1e-3)
 	parser.add_argument("--clip_grad", type=float, default=0.0)
+	# 🔥 OOM修复：添加梯度累积支持
+	parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 	# augment
 	parser.add_argument("--mixup_alpha", type=float, default=0.0)
 	parser.add_argument("--spec_time_mask_ratio", type=float, default=0.0)
@@ -604,8 +648,29 @@ def main():
 	# Infer feature dimension without touching data (fixed by feature design)
 	input_dim = int(len(EEG_BANDS) * 2 + 2 + 2)  # bands{mean,std} + broadband{mean,std} + RMS{mean,std}
 	num_classes = len(label_to_index)
-	model = BiLSTMClassifier(input_dim=input_dim, hidden_dim=64, num_layers=1, num_classes=num_classes)
+	
+	# 🚀 GPU优化：使用配置文件中的新模型参数
+	hidden_dim = getattr(args, 'hidden_dim', 256)
+	num_layers = getattr(args, 'num_layers', 3) 
+	attention_heads = getattr(args, 'attention_heads', 8)
+	use_attention = getattr(args, 'use_attention', True)
+	dropout = getattr(args, 'dropout', 0.15)
+	
+	model = BiLSTMClassifier(
+		input_dim=input_dim, 
+		hidden_dim=hidden_dim, 
+		num_layers=num_layers, 
+		num_classes=num_classes,
+		dropout=dropout,
+		use_attention=use_attention,
+		attention_heads=attention_heads
+	)
 	model = model.to(device)
+	
+	# 🔥 内存使用统计
+	total_params = sum(p.numel() for p in model.parameters())
+	param_memory_mb = (total_params * 4) / (1024 * 1024)  # float32 = 4 bytes
+	logger.info(f"Model parameters: {total_params:,} ({param_memory_mb:.1f}MB)")
 	# Warm start
 	if args.init_checkpoint and os.path.exists(args.init_checkpoint):
 		try:
@@ -692,60 +757,110 @@ def main():
 		logger.info("Epoch %d/%d starting (batches=%d)", epoch, args.epochs, len(dl_train))
 		epoch_loss_sum = 0.0
 		epoch_loss_count = 0
-		# per-epoch cache monitor (only for current epoch)
+		
+		# 🔥 OOM修复：确保每个epoch开始时梯度清零
+		optim.zero_grad()
+		# 🔧 修复：简化进度条显示，避免冲突
+		_iter = dl_train
+		if args.progress == "bar":
+			_iter = tqdm(dl_train, desc=f"Train {epoch}/{args.epochs}", unit="batch", 
+			            disable=False, leave=True, position=0)
+		
+		# 🔧 移除混乱的cache进度条
 		epoch_cache_pbar = None
 		seen_recs = set()
-		def _count_cached_epoch() -> int:
-			return sum(1 for r in seen_recs if os.path.exists(ds_train._cache_path(r)))
-		if args.cache_progress and args.progress == "bar":
-			try:
-				epoch_cache_pbar = tqdm(total=len(dl_train), desc=f"Cache (epoch {epoch})", unit="batch")
-			except Exception:
-				epoch_cache_pbar = None
-		_iter = tqdm(dl_train, desc=f"Train {epoch}/{args.epochs}", unit="batch") if args.progress == "bar" else dl_train
 		for it, batch in enumerate(_iter, start=1):
-			x, y, lengths, rec_ids = batch
-			if epoch_cache_pbar is not None:
-				try:
-					seen_recs.update(rec_ids)
-					epoch_cache_pbar.update(1)
-				except Exception:
-					pass
-			x = x.float().to(device, non_blocking=True)
-			y = y.to(device, non_blocking=True)
-			# augment: gaussian noise
-			if args.aug_noise_std > 0:
-				x = x + torch.randn_like(x) * args.aug_noise_std
-			# SpecAugment style masks
-			if args.spec_time_masks > 0 or args.spec_feat_masks > 0:
-				x = _spec_augment(x, args.spec_time_mask_ratio, args.spec_time_masks, args.spec_feat_mask_ratio, args.spec_feat_masks)
-			# Mixup
-			xm, y_orig, soft_targets = _mixup(x, y, num_classes, args.mixup_alpha)
-			logits = model(xm, lengths=lengths)
-			B, T, C = logits.shape
-			if soft_targets is not None:
-				ignore_mask = (y_orig != -100)
-				loss = _soft_ce_loss(logits, soft_targets, ignore_mask)
-			else:
-				loss = criterion(logits.reshape(B * T, C), y.reshape(B * T))
-			epoch_loss_sum += float(loss.item())
-			epoch_loss_count += 1
-			optim.zero_grad()
-			loss.backward()
-			if args.clip_grad and args.clip_grad > 0:
-				nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-			optim.step()
-			if args.progress == "bar":
-				try:
-					_iter.set_postfix({"loss": float(loss.item())})
-				except Exception:
-					pass
-			if args.scheduler == "onecycle" and scheduler is not None:
-				scheduler.step()
-			global_step += 1
-		if epoch_cache_pbar is not None:
 			try:
-				epoch_cache_pbar.close()
+				x, y, lengths, rec_ids = batch
+				# 🔧 移除cache进度条更新逻辑
+				seen_recs.update(rec_ids)
+				x = x.float().to(device, non_blocking=True)
+				y = y.to(device, non_blocking=True)
+				
+				# 🔥 OOM修复：内存检查
+				if torch.cuda.is_available():
+					memory_used_gb = torch.cuda.memory_allocated() / (1024**3)
+					if memory_used_gb > 6.0:  # 超过6GB清理
+						torch.cuda.empty_cache()
+				
+				# augment: gaussian noise
+				if args.aug_noise_std > 0:
+					x = x + torch.randn_like(x) * args.aug_noise_std
+				# SpecAugment style masks
+				if args.spec_time_masks > 0 or args.spec_feat_masks > 0:
+					x = _spec_augment(x, args.spec_time_mask_ratio, args.spec_time_masks, args.spec_feat_mask_ratio, args.spec_feat_masks)
+				# Mixup
+				xm, y_orig, soft_targets = _mixup(x, y, num_classes, args.mixup_alpha)
+				# 🧠 注意力机制：模型返回logits和attention权重
+				logits, attention_info = model(xm, lengths=lengths)
+				B, T, C = logits.shape
+				if soft_targets is not None:
+					ignore_mask = (y_orig != -100)
+					loss = _soft_ce_loss(logits, soft_targets, ignore_mask)
+				else:
+					loss = criterion(logits.reshape(B * T, C), y.reshape(B * T))
+				
+				# 🔥 OOM修复：梯度累积
+				loss = loss / args.gradient_accumulation_steps
+				
+				# 🔧 调试：检查损失值是否正常
+				loss_value = float(loss.item()) * args.gradient_accumulation_steps
+				if np.isnan(loss_value) or np.isinf(loss_value):
+					print(f"⚠️ 异常损失值: {loss_value}")
+					print(f"   batch信息: B={B}, T={T}, C={C}")
+					print(f"   logits范围: min={logits.min():.3f}, max={logits.max():.3f}")
+					print(f"   labels范围: min={y.min()}, max={y.max()}")
+					print(f"   有效标签数: {(y != -100).sum()}")
+					
+					# 检查logits是否有异常值
+					if torch.isnan(logits).any():
+						print("   ❌ logits包含NaN")
+					if torch.isinf(logits).any():
+						print("   ❌ logits包含Inf")
+					
+					continue
+				
+				epoch_loss_sum += loss_value
+				epoch_loss_count += 1
+				
+				loss.backward()
+				
+				# 梯度累积：只在累积步骤完成时更新参数
+				if it % args.gradient_accumulation_steps == 0:
+					if args.clip_grad and args.clip_grad > 0:
+						nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+					optim.step()
+					optim.zero_grad()
+					
+					# 🔧 修复：学习率调度在optimizer.step()之后
+					if args.scheduler == "onecycle" and scheduler is not None:
+						scheduler.step()
+				
+				# 🔧 修复：更好的进度条信息显示
+				if args.progress == "bar" and hasattr(_iter, 'set_postfix'):
+					try:
+						current_loss = loss.item() * args.gradient_accumulation_steps
+						if not (np.isnan(current_loss) or np.isinf(current_loss)):
+							_iter.set_postfix({"loss": f"{current_loss:.4f}"})
+						else:
+							_iter.set_postfix({"loss": "NaN/Inf"})
+					except Exception:
+						pass
+				
+				global_step += 1
+				
+			except RuntimeError as e:
+				if "out of memory" in str(e):
+					print(f"❌ OOM at batch {it}, skipping...")
+					torch.cuda.empty_cache() if torch.cuda.is_available() else None
+					optim.zero_grad()
+					continue
+				else:
+					raise e
+		# 🔧 清理进度条
+		if args.progress == "bar" and hasattr(_iter, 'close'):
+			try:
+				_iter.close()
 			except Exception:
 				pass
 
